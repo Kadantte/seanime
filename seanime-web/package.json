@@ -129,7 +129,7 @@
         "tailwind-merge": "~2.6.0",
         "tailwind-scrollbar-hide": "~1.1.7",
         "tailwindcss-animate": "~1.0.7",
-        "tsx": "^4.21.0",
+        "tsx": "^4.22.4",
         "upath": "^2.0.1",
         "use-debounce": "^10.1.1",
         "vaul": "^1.1.2",
