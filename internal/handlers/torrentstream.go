@@ -9,6 +9,7 @@ import (
 	"seanime/internal/events"
 	hibiketorrent "seanime/internal/extension/hibike/torrent"
 	"seanime/internal/torrentstream"
+	"seanime/internal/util"
 
 	"github.com/labstack/echo/v4"
 )
@@ -53,7 +54,7 @@ func (h *Handler) HandleSaveTorrentstreamSettings(c echo.Context) error {
 
 	// Validate the download directory
 	if b.Settings.DownloadDir != "" {
-		dir, err := os.Stat(b.Settings.DownloadDir)
+		dir, err := os.Stat(util.ResolvePhysicalPath(b.Settings.DownloadDir))
 		if err != nil {
 			h.App.Logger.Error().Err(err).Msgf("torrentstream: Download directory %s does not exist", b.Settings.DownloadDir)
 			h.App.WSEventManager.SendEvent(events.ErrorToast, "Download directory does not exist")
@@ -227,8 +228,34 @@ func (h *Handler) HandleGetTorrentstreamBatchHistory(c echo.Context) error {
 		return h.RespondWithError(c, err)
 	}
 
+	if b.MediaID == 0 {
+		return h.RespondWithData(c, &torrentstream.BatchHistoryResponse{})
+	}
+
 	ret := h.App.TorrentstreamRepository.GetBatchHistory(b.MediaID)
 	return h.RespondWithData(c, ret)
+}
+
+// HandleDeleteTorrentstreamBatchHistory
+//
+//	@summary deletes the saved batch selection.
+//	@desc This clears the saved previous batch selection for a media entry.
+//	@returns bool
+//	@route /api/v1/torrentstream/batch-history/delete [POST]
+func (h *Handler) HandleDeleteTorrentstreamBatchHistory(c echo.Context) error {
+	type body struct {
+		MediaID int `json:"mediaId"`
+	}
+	var b body
+	if err := c.Bind(&b); err != nil {
+		return h.RespondWithError(c, err)
+	}
+
+	if err := h.App.TorrentstreamRepository.DeleteBatchHistory(b.MediaID); err != nil {
+		return h.RespondWithError(c, err)
+	}
+
+	return h.RespondWithData(c, true)
 }
 
 // route /api/v1/torrentstream/stream/*

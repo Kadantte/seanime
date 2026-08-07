@@ -251,7 +251,7 @@ const NumberField = React.memo(withControlledInput(forwardRef<HTMLInputElement, 
     ({ onChange, ...props }, ref) => {
         return <NumberInput
             {...props}
-            onValueChange={onChange}
+            onValueChange={(value, valueAsString) => onChange(valueAsString === "" ? undefined : value)}
             ref={ref}
         />
     },
@@ -310,8 +310,10 @@ const RadioGroupField = React.memo(withControlledInput(forwardRef<HTMLButtonElem
 )))
 
 
-const RadioCardsField = React.memo(withControlledInput(forwardRef<HTMLButtonElement, FieldComponent<RadioGroupProps>>(
-    ({ onChange, itemContainerClass, itemClass, ...props }, ref) => {
+const RadioCardsField = React.memo(withControlledInput(forwardRef<HTMLButtonElement, FieldComponent<RadioGroupProps & {
+    radioGroupStackClass?: string
+}>>(
+    ({ onChange, itemContainerClass, itemClass, radioGroupStackClass, ...props }, ref) => {
         return <RadioGroup
             // itemContainerClass={cn(
             //     "items-start cursor-pointer transition border-transparent rounded-[--radius] p-4 w-full",
@@ -330,7 +332,7 @@ const RadioCardsField = React.memo(withControlledInput(forwardRef<HTMLButtonElem
                 "items-start cursor-pointer transition border-transparent rounded-[--radius] p-3 w-full md:w-fit",
                 "bg-transparent dark:hover:bg-gray-900 dark:bg-transparent",
                 "data-[state=checked]:bg-brand-500/5 dark:data-[state=checked]:bg-gray-900",
-                "focus:ring-2 ring-brand-100 dark:ring-brand-900 ring-offset-1 ring-offset-[--background] focus-within:ring-transparent transition",
+                "focus:outline-none focus:ring-1 ring-offset-1 ring-offset-[--background] focus:ring-white/40 focus-within:ring-transparent transition",
                 "dark:border dark:data-[state=checked]:border-[--border] data-[state=checked]:ring-offset-0",
                 itemContainerClass,
             )}
@@ -345,7 +347,7 @@ const RadioCardsField = React.memo(withControlledInput(forwardRef<HTMLButtonElem
             // stackClass="flex flex-col md:flex-row flex-wrap gap-2 space-y-0"
             {...props}
             onValueChange={onChange}
-            stackClass="flex flex-col md:flex-row gap-2 space-y-0"
+            stackClass={cn("flex flex-col md:flex-row gap-2 space-y-0", radioGroupStackClass)}
             ref={ref}
         />
     },

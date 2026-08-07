@@ -67,6 +67,7 @@ export function ChapterReaderDrawer(props: ChapterDrawerProps) {
     const currentPageIndex = useAtomValue(__manga_currentPageIndexAtom)
     const setCurrentPageIndex = useSetAtom(__manga_currentPageIndexAtom)
     const setCurrentPaginationMapIndex = useSetAtom(__manga_currentPaginationMapIndexAtom)
+    const setIsLastPage = useSetAtom(__manga_isLastPageAtom)
 
     const [readingMode, setReadingMode] = useAtom(__manga_readingModeAtom)
     const isLastPage = useAtomValue(__manga_isLastPageAtom)
@@ -217,12 +218,14 @@ export function ChapterReaderDrawer(props: ChapterDrawerProps) {
     React.useEffect(() => {
         if (!currentChapterResumeKey) {
             restoredChapterResumeKeyRef.current = null
+            setIsLastPage(false)
             setCurrentPageIndex(0)
             setCurrentPaginationMapIndex(0)
             return
         }
 
         restoredChapterResumeKeyRef.current = null
+        setIsLastPage(false)
         setCurrentPageIndex(shouldRestoreSavedPage ? currentResumeLocation?.pageIndex ?? 0 : 0)
         setCurrentPaginationMapIndex(0)
     }, [currentChapterResumeKey])
@@ -383,7 +386,7 @@ export function ChapterReaderDrawer(props: ChapterDrawerProps) {
             side="bottom"
             headerClass="absolute h-0"
             contentClass={cn(
-                "p-0 pt-0 !m-0 !rounded-none",
+                "p-0 pt-0 !m-0 !rounded-none overflow-hidden",
                 "w-full inset-x-0 bottom-0 border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
             )}
             hideCloseButton
@@ -442,7 +445,7 @@ export function ChapterReaderDrawer(props: ChapterDrawerProps) {
             <div
                 data-chapter-reader-drawer-content
                 className={cn(
-                    "max-h-[calc(100dvh-3rem)] h-full",
+                    "max-h-[calc(100dvh-3rem)] h-full overflow-hidden",
                     hiddenBar && "max-h-dvh",
                 )} tabIndex={-1}
             >

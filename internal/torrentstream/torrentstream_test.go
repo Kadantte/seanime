@@ -1,6 +1,7 @@
 package torrentstream
 
 import (
+	"context"
 	"encoding/json"
 	"seanime/internal/api/anilist"
 	"seanime/internal/api/metadata_provider"
@@ -19,6 +20,20 @@ import (
 	"github.com/samber/mo"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGetMediaInfoFromOptionsUsesProvidedMedia(t *testing.T) {
+	repo, _, _ := newTorrentstreamTestRepository(t)
+	media := testmocks.NewBaseAnime(990748023463256, "Custom Source Anime")
+
+	opts := &StartStreamOptions{MediaId: media.ID}
+	opts.SetMedia(media)
+
+	got, _, err := repo.GetMediaInfoFromOptions(context.Background(), opts)
+
+	require.NoError(t, err)
+	require.Equal(t, media.ID, got.GetID())
+	require.Equal(t, media.GetPreferredTitle(), got.GetPreferredTitle())
+}
 
 type recordedWSEvent struct {
 	clientID string
@@ -229,6 +244,24 @@ func TestRepositoryDefaultsAndSettingsGuards(t *testing.T) {
 	require.Equal(t, "/custom/downloads", repo.GetDownloadDir())
 }
 
+func TestStreamOptionsMatchAllowsImplicitFileIndex(t *testing.T) {
+	fileIndex := 3
+	prepared := &StartStreamOptions{MediaId: 10, EpisodeNumber: 4, AniDBEpisode: "4", FileIndex: &fileIndex}
+	request := &StartStreamOptions{MediaId: 10, EpisodeNumber: 4, AniDBEpisode: "4"}
+
+	require.True(t, streamOptionsMatch(request, prepared))
+	require.True(t, streamOptionsMatch(prepared, request))
+}
+
+func TestStreamOptionsMatchRejectsExplicitDifferentFileIndex(t *testing.T) {
+	preparedIndex := 3
+	requestIndex := 4
+	prepared := &StartStreamOptions{MediaId: 10, EpisodeNumber: 4, AniDBEpisode: "4", FileIndex: &preparedIndex}
+	request := &StartStreamOptions{MediaId: 10, EpisodeNumber: 4, AniDBEpisode: "4", FileIndex: &requestIndex}
+
+	require.False(t, streamOptionsMatch(request, prepared))
+}
+
 func TestInitModulesRejectsNilSettingsAndDisablesModule(t *testing.T) {
 	repo, _, _ := newTorrentstreamTestRepository(t)
 
@@ -349,6 +382,42 @@ func TestAddBatchHistoryUpdatesExistingRecord(t *testing.T) {
 	require.NotNil(t, history.BatchEpisodeFiles)
 	require.Equal(t, 5, history.BatchEpisodeFiles.CurrentEpisodeNumber)
 	require.Equal(t, "5", history.BatchEpisodeFiles.CurrentAniDBEpisode)
+}
+
+func TestDeleteBatchHistoryRemovesRecordAndInvalidatesQueries(t *testing.T) {
+	repo, _, ws := newTorrentstreamTestRepository(t)
+
+	repo.AddBatchHistory(102, &hibiketorrent.AnimeTorrent{
+		Name:     "[Seanime] Example Show - 01-12 (1080p).mkv",
+		InfoHash: "hash-delete",
+		IsBatch:  true,
+	}, &hibiketorrent.BatchEpisodeFiles{CurrentEpisodeNumber: 1, CurrentAniDBEpisode: "1"})
+
+	require.Eventually(t, func() bool {
+		got := repo.GetBatchHistory(102)
+		return got.Torrent != nil && got.Torrent.InfoHash == "hash-delete"
+	}, 2*time.Second, 20*time.Millisecond)
+
+	repo.DeleteBatchHistory(102)
+
+	require.Eventually(t, func() bool {
+		got := repo.GetBatchHistory(102)
+		return got.Torrent == nil && got.Metadata == nil && got.BatchEpisodeFiles == nil
+	}, 2*time.Second, 20*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		count := 0
+		for _, event := range ws.snapshot() {
+			if event.event != events.InvalidateQueries {
+				continue
+			}
+			payload, ok := event.payload.([]string)
+			if ok && len(payload) == 1 && payload[0] == events.GetTorrentstreamBatchHistoryEndpoint {
+				count++
+			}
+		}
+		return count >= 2
+	}, 2*time.Second, 20*time.Millisecond)
 }
 
 func decodePayloadMap(t *testing.T, payload interface{}) map[string]interface{} {

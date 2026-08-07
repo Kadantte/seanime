@@ -16,6 +16,7 @@ import {
     AL_StudioDetails,
     Nullish,
 } from "@/api/generated/types"
+import { getEntryPreloadStaleTime } from "@/lib/entry-preloader"
 import { useQueryClient } from "@tanstack/react-query"
 import { toast } from "sonner"
 
@@ -27,7 +28,6 @@ export function useGetAnimeCollection() {
         enabled: true,
     })
 }
-
 export function useGetRawAnimeCollection() {
     return useServerQuery<AL_AnimeCollection>({
         endpoint: API_ENDPOINTS.ANILIST.GetRawAnimeCollection.endpoint,
@@ -36,7 +36,6 @@ export function useGetRawAnimeCollection() {
         enabled: true,
     })
 }
-
 export function useGetRawAnimeCollectionTags() {
     return useServerQuery<Record<number, Array<string>>>({
         endpoint: API_ENDPOINTS.ANILIST.GetRawAnimeCollectionTags.endpoint,
@@ -102,6 +101,7 @@ export function useGetAnilistAnimeDetails(id: Nullish<number | string>) {
         method: API_ENDPOINTS.ANILIST.GetAnilistAnimeDetails.methods[0],
         queryKey: [API_ENDPOINTS.ANILIST.GetAnilistAnimeDetails.key, String(id)],
         enabled: !!id,
+        staleTime: getEntryPreloadStaleTime("anime", id),
     })
 }
 

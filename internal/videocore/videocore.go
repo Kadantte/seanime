@@ -114,9 +114,16 @@ func (vc *VideoCore) SetSettings(settings *models.Settings) {
 		vc.translatorService.Shutdown()
 	}
 	vc.translatorService = nil
-	if settings.GetMediaPlayer().VcTranslate {
-		vc.logger.Trace().Msgf("videocore: Setting up translator service %s", settings.GetMediaPlayer().VcTranslateProvider)
-		vc.translatorService = NewTranslatorService(vc, settings.GetMediaPlayer().VcTranslateApiKey, settings.GetMediaPlayer().VcTranslateProvider, settings.GetMediaPlayer().VcTranslateTargetLanguage)
+	mediaPlayer := settings.GetMediaPlayer()
+	if mediaPlayer.VcTranslate {
+		vc.logger.Trace().Msgf("videocore: Setting up translator service %s", mediaPlayer.VcTranslateProvider)
+		vc.translatorService = newTranslatorService(vc, translationSettings{
+			apiKey:     mediaPlayer.VcTranslateApiKey,
+			provider:   mediaPlayer.VcTranslateProvider,
+			targetLang: mediaPlayer.VcTranslateTargetLanguage,
+			baseUrl:    mediaPlayer.VcTranslateBaseUrl,
+			model:      mediaPlayer.VcTranslateModel,
+		})
 	}
 }
 
@@ -729,6 +736,17 @@ func (vc *VideoCore) SendGetPlaybackState() {
 	vc.sendPlayerEventTo(state.ClientId, string(ServerEventGetPlaybackState), nil)
 }
 
+var playerEventResponseTimeout = 5 * time.Second
+
+func waitPlayerEventResp(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	case <-time.After(playerEventResponseTimeout):
+		return false
+	}
+}
+
 // GetPlaylist sends a get-text-tracks request to the video player and returns the text tracks.
 func (vc *VideoCore) GetTextTracks() (ret []*VideoTextTrack, ok bool) {
 	state, ok := vc.GetPlaybackState()
@@ -745,12 +763,12 @@ func (vc *VideoCore) GetTextTracks() (ret []*VideoTextTrack, ok bool) {
 		}
 		return true // keep listening
 	})
-	go func(cancel func()) {
-		defer cancel()
-		<-time.After(5 * time.Second)
-	}(cancel)
+	defer cancel()
+
 	vc.sendPlayerEventTo(state.ClientId, string(ServerEventGetTextTracks), nil)
-	<-done
+	if !waitPlayerEventResp(done) {
+		return nil, false
+	}
 	return ret, ret != nil
 }
 
@@ -770,12 +788,12 @@ func (vc *VideoCore) GetPlaylist() (ret *VideoPlaylistState, ok bool) {
 		}
 		return true // keep listening
 	})
-	go func(cancel func()) {
-		defer cancel()
-		<-time.After(5 * time.Second)
-	}(cancel)
+	defer cancel()
+
 	vc.sendPlayerEventTo(state.ClientId, string(ServerEventGetPlaylist), nil)
-	<-done
+	if !waitPlayerEventResp(done) {
+		return nil, false
+	}
 	return ret, ret != nil
 }
 
@@ -799,13 +817,10 @@ func (vc *VideoCore) GetSkipData() (ret *SkipData, ok bool) {
 	defer cancel()
 
 	vc.sendPlayerEventTo(state.ClientId, string(ServerEventGetSkipData), nil)
-
-	select {
-	case <-done:
+	if waitPlayerEventResp(done) {
 		return ret, true
-	case <-time.After(5 * time.Second):
-		return nil, false
 	}
+	return nil, false
 }
 
 // PullStatus pulls the current playback status from the video player.
@@ -824,12 +839,12 @@ func (vc *VideoCore) PullStatus() (ret VideoStatusEvent, ok bool) {
 		}
 		return true // keep listening
 	})
-	go func(cancel func()) {
-		defer cancel()
-		<-time.After(5 * time.Second)
-	}(cancel)
+	defer cancel()
+
 	vc.sendPlayerEventTo(state.ClientId, string(ServerEventGetStatus), nil, true)
-	<-done
+	if !waitPlayerEventResp(done) {
+		return VideoStatusEvent{}, false
+	}
 	return ret, true
 }
 
@@ -861,9 +876,20 @@ func (vc *VideoCore) listenToClientEvents() {
 				}
 
 				// Validate that the event is from the current client
+				takeover := false
 				currentState, hasState := vc.GetPlaybackState()
 				if hasState && eventClientID != "" && eventClientID != currentState.ClientId {
-					continue
+					ownerConnected := false
+					for _, clientID := range vc.wsEventManager.GetClientIds() {
+						if clientID == currentState.ClientId {
+							ownerConnected = true
+							break
+						}
+					}
+					if ownerConnected || playerEvent.Type != PlayerEventVideoLoaded {
+						continue
+					}
+					takeover = true
 				}
 
 				// Handle events
@@ -871,6 +897,9 @@ func (vc *VideoCore) listenToClientEvents() {
 				case PlayerEventVideoLoaded:
 					payload := &clientVideoLoadedPayload{}
 					if err := playerEvent.UnmarshalAs(&payload); err == nil {
+						if takeover {
+							vc.clearPlayback()
+						}
 						vc.setPlaybackState(&payload.State)
 						vc.PushEvent(&VideoLoadedEvent{
 							State: payload.State,

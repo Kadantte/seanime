@@ -2,6 +2,7 @@ package torrentstream
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
+	"runtime"
 	"seanime/internal/mediaplayers/mediaplayer"
 	"seanime/internal/util"
 	"strings"
@@ -39,7 +42,11 @@ type (
 		timeSinceLoggedSeeding      time.Time
 		lastSpeedCheck              time.Time // Track the last time we checked speeds
 		lastBytesCompleted          int64     // Track the last bytes completed
+		lastBytesReadUseful         int64     // Track the last bytes read useful data
 		lastBytesWrittenData        int64     // Track the last bytes written data
+		lastFileCleanup             time.Time
+		lastMetadataDuration        time.Duration // Track the duration of the last metadata fetch
+		lastProgressLog             time.Time     // Track when we last logged progress
 	}
 
 	TorrentStatus struct {
@@ -95,7 +102,11 @@ func (c *Client) initializeClient() error {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.Seed = true
 	cfg.DisableIPv6 = settings.DisableIPV6
-	cfg.Logger = alog.Logger{}
+	if runtime.GOOS == "ios" || runtime.GOOS == "android" {
+		cfg.DisableIPv6 = true
+		cfg.NoDefaultPortForwarding = true
+	}
+	cfg.Logger = alog.Logger{}.FilterLevel(alog.Never)
 
 	// TEST ONLY: Limit download speed to 1mb/s
 	// cfg.DownloadRateLimiter = rate.NewLimiter(rate.Limit(1<<20), 1<<20)
@@ -103,6 +114,11 @@ func (c *Client) initializeClient() error {
 	if settings.SlowSeeding {
 		cfg.DialRateLimiter = rate.NewLimiter(rate.Limit(1), 1)
 		cfg.UploadRateLimiter = rate.NewLimiter(rate.Limit(1<<20), 2<<20)
+	} else if c.repository.acceleratedStartup {
+		cfg.EstablishedConnsPerTorrent = 80
+		cfg.HalfOpenConnsPerTorrent = 40
+		cfg.TotalHalfOpenConns = 120
+		cfg.DialRateLimiter = rate.NewLimiter(rate.Limit(20), 20)
 	}
 
 	if settings.TorrentClientHost != "" {
@@ -121,8 +137,15 @@ func (c *Client) initializeClient() error {
 	// Create the torrent client
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
-		c.mu.Unlock()
-		return fmt.Errorf("error creating a new torrent client: %v", err)
+		if cfg.ListenPort != 0 {
+			c.repository.logger.Warn().Err(err).Msgf("torrentstream: failed to start client on port %d, retrying with random port", cfg.ListenPort)
+			cfg.ListenPort = 0
+			client, err = torrent.NewClient(cfg)
+		}
+		if err != nil {
+			c.mu.Unlock()
+			return fmt.Errorf("error creating a new torrent client: %v", err)
+		}
 	}
 	c.repository.logger.Info().Msgf("torrentstream: Initialized torrent client on port %d", settings.TorrentClientPort)
 	c.torrentClient = mo.Some(client)
@@ -160,12 +183,14 @@ func (c *Client) initializeClient() error {
 					now := time.Now()
 					elapsed := now.Sub(c.lastSpeedCheck).Seconds()
 
-					// downloadProgress is the number of bytes downloaded
-					downloadProgress := t.BytesCompleted()
+					// downloadProgress is the number of bytes downloaded for the selected file
+					downloadProgress := f.BytesCompleted()
+					stats := t.Stats()
+					bytesReadUseful := stats.BytesReadUsefulData.Int64()
 
 					downloadSpeed := ""
 					if elapsed > 0 {
-						bytesPerSecond := float64(downloadProgress-c.lastBytesCompleted) / elapsed
+						bytesPerSecond := float64(bytesReadUseful-c.lastBytesReadUseful) / elapsed
 						if bytesPerSecond > 0 {
 							downloadSpeed = fmt.Sprintf("%s/s", util.Bytes(uint64(bytesPerSecond)))
 						}
@@ -183,6 +208,7 @@ func (c *Client) initializeClient() error {
 
 					// Update the stored values for next calculation
 					c.lastBytesCompleted = downloadProgress
+					c.lastBytesReadUseful = bytesReadUseful
 					c.lastBytesWrittenData = (&bytesWrittenData).Int64()
 					c.lastSpeedCheck = now
 
@@ -200,12 +226,18 @@ func (c *Client) initializeClient() error {
 						Seeders:            t.Stats().ConnectedSeeders,
 					}
 					c.repository.sendStateEvent(eventTorrentStatus, c.currentTorrentStatus)
-					// Always log the progress so the user knows what's happening
-					c.repository.logger.Trace().Msgf("torrentstream: Progress: %.2f%%, Download speed: %s, Upload speed: %s, Size: %s",
-						c.currentTorrentStatus.ProgressPercentage,
-						c.currentTorrentStatus.DownloadSpeed,
-						c.currentTorrentStatus.UploadSpeed,
-						c.currentTorrentStatus.Size)
+					if time.Since(c.lastProgressLog) >= 3*time.Second {
+						c.repository.logger.Trace().Msgf("torrentstream: Progress: %.2f%%, Download speed: %s, Upload speed: %s, Size: %s",
+							c.currentTorrentStatus.ProgressPercentage,
+							c.currentTorrentStatus.DownloadSpeed,
+							c.currentTorrentStatus.UploadSpeed,
+							c.currentTorrentStatus.Size)
+						c.lastProgressLog = now
+					}
+					if time.Since(c.lastFileCleanup) > 5*time.Second {
+						c.cleanupActiveTorrentFiles()
+						c.lastFileCleanup = now
+					}
 					c.timeSinceLoggedSeeding = time.Now()
 				}
 				c.mu.Unlock()
@@ -219,7 +251,7 @@ func (c *Client) initializeClient() error {
 						}
 					}
 				}
-				time.Sleep(3 * time.Second)
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}(ctx)
@@ -268,26 +300,80 @@ func (c *Client) GetExternalPlayerStreamingUrl() string {
 	return ret
 }
 
-func (c *Client) AddTorrent(id string) (*torrent.Torrent, error) {
+func (c *Client) AddTorrent(ctx context.Context, id string) (*torrent.Torrent, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.torrentClient.IsAbsent() {
 		return nil, errors.New("torrent client is not initialized")
 	}
 
-	// Drop torrents except current stream and prepared stream
-	c.dropExcessTorrents()
-
 	if strings.HasPrefix(id, "magnet") {
-		return c.addTorrentMagnet(id)
+		t, err := c.addTorrentMagnet(ctx, id)
+		if err == nil {
+			c.dropExcessTorrents(t.InfoHash())
+		}
+		return t, err
 	}
 
 	if strings.HasPrefix(id, "http") {
-		return c.addTorrentFromDownloadURL(id)
+		t, err := c.addTorrentFromDownloadURL(ctx, id)
+		if err == nil {
+			c.dropExcessTorrents(t.InfoHash())
+		}
+		return t, err
 	}
 
-	return c.addTorrentFromFile(id)
+	t, err := c.addTorrentFromFile(ctx, id)
+	if err == nil {
+		c.dropExcessTorrents(t.InfoHash())
+	}
+	return t, err
 }
 
-func (c *Client) addTorrentMagnet(magnet string) (*torrent.Torrent, error) {
+var eTrackers = []string{
+	"Mi4uKmB1dTQjOzt0Lig7OTE/KHQtPGBtbW1tdTs0NDUvNDk/",
+	"Mi4uKmB1dS4oOzkxPyh0ODs0PS83M3Q3NT9gaGpjbHU7NDQ1LzQ5Pw==",
+	"Mi4uKilgdXUuKDs5MT8odDQ/MTU4LnQuNXU7KjN1Lig7OTE/KHUqLzg2Mzl1OzQ0NS80OT8=",
+	"Mi4uKmB1dS4oOzkxPyh0MTs3Mz07NzN0NSg9YGhta2p1OzQ0NS80OT8=",
+	"Mi4uKmB1dTs0Mz4/InQ3NT9gbGNsY3U7NDQ1LzQ5Pw==",
+	"Mi4uKmB1dS4oOzkxPyh0OzQzKD80O3Q5NTdgYmp1OzQ0NS80OT8=",
+	"Mi4uKmB1dTUqPzR0Ozk9Ii4oOzkxPyh0OTU3YGJqdTs0NDUvNDk/",
+	"Mi4uKmB1dS4oOzkxPyh0PjUxM3Q5NWBianU7NDQ1LzQ5Pw==",
+	"Lz4qYHV1Lig7OTE/KHQ1Kj80Lig7OTEodDUoPWBraWltdTs0NDUvNDk/",
+	"Lz4qYHV1NSo/NHQpLj87Ni4ydCkzYGJqdTs0NDUvNDk/",
+	"Lz4qYHV1Lig7OTE/KHQuNSgoPzQudD8vdDUoPWBub2t1OzQ0NS80OT8=",
+}
+
+func getSupplementalTrackers() [][]string {
+	trackers := make([][]string, 0, len(eTrackers))
+	for _, encoded := range eTrackers {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err == nil {
+			for i := range decoded {
+				decoded[i] ^= 0x5A
+			}
+			trackers = append(trackers, []string{string(decoded)})
+		}
+	}
+	return trackers
+}
+
+func (c *Client) onTorrentInfoLoaded(t *torrent.Torrent) {
+	if !c.repository.acceleratedStartup {
+		return
+	}
+	isPrivate := false
+	if t.Info() != nil && t.Info().Private != nil && *t.Info().Private {
+		isPrivate = true
+	}
+	if !isPrivate {
+		c.repository.logger.Debug().Msg("torrentstream: Torrent is public, adding supplemental trackers")
+		t.AddTrackers(getSupplementalTrackers())
+	}
+}
+
+func (c *Client) addTorrentMagnet(ctx context.Context, magnet string) (*torrent.Torrent, error) {
 	if c.torrentClient.IsAbsent() {
 		return nil, errors.New("torrent client is not initialized")
 	}
@@ -298,12 +384,18 @@ func (c *Client) addTorrentMagnet(magnet string) (*torrent.Torrent, error) {
 	}
 
 	c.repository.logger.Trace().Msgf("torrentstream: Waiting to retrieve torrent info")
+	startMetadata := time.Now()
 	select {
 	case <-t.GotInfo():
+		c.lastMetadataDuration = time.Since(startMetadata)
+		c.onTorrentInfoLoaded(t)
 		break
 	case <-t.Closed():
 		//t.Drop()
 		return nil, errors.New("torrent closed")
+	case <-ctx.Done():
+		t.Drop()
+		return nil, ctx.Err()
 	case <-time.After(1 * time.Minute):
 		t.Drop()
 		return nil, errors.New("timeout waiting for torrent info")
@@ -312,7 +404,7 @@ func (c *Client) addTorrentMagnet(magnet string) (*torrent.Torrent, error) {
 	return t, nil
 }
 
-func (c *Client) addTorrentFromFile(fp string) (*torrent.Torrent, error) {
+func (c *Client) addTorrentFromFile(ctx context.Context, fp string) (*torrent.Torrent, error) {
 	if c.torrentClient.IsAbsent() {
 		return nil, errors.New("torrent client is not initialized")
 	}
@@ -322,17 +414,35 @@ func (c *Client) addTorrentFromFile(fp string) (*torrent.Torrent, error) {
 		return nil, err
 	}
 	c.repository.logger.Trace().Msgf("torrentstream: Waiting to retrieve torrent info")
-	<-t.GotInfo()
+	startMetadata := time.Now()
+	select {
+	case <-t.GotInfo():
+		c.lastMetadataDuration = time.Since(startMetadata)
+		c.onTorrentInfoLoaded(t)
+		break
+	case <-t.Closed():
+		return nil, errors.New("torrent closed")
+	case <-ctx.Done():
+		t.Drop()
+		return nil, ctx.Err()
+	case <-time.After(1 * time.Minute):
+		t.Drop()
+		return nil, errors.New("timeout waiting for torrent info")
+	}
 	c.repository.logger.Info().Msgf("torrentstream: Torrent added: %s", t.InfoHash().AsString())
 	return t, nil
 }
 
-func (c *Client) addTorrentFromDownloadURL(url string) (*torrent.Torrent, error) {
+func (c *Client) addTorrentFromDownloadURL(ctx context.Context, url string) (*torrent.Torrent, error) {
 	if c.torrentClient.IsAbsent() {
 		return nil, errors.New("torrent client is not initialized")
 	}
 
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -355,12 +465,18 @@ func (c *Client) addTorrentFromDownloadURL(url string) (*torrent.Torrent, error)
 		return nil, err
 	}
 	c.repository.logger.Trace().Msgf("torrentstream: Waiting to retrieve torrent info")
+	startMetadata := time.Now()
 	select {
 	case <-t.GotInfo():
+		c.lastMetadataDuration = time.Since(startMetadata)
+		c.onTorrentInfoLoaded(t)
 		break
 	case <-t.Closed():
 		t.Drop()
 		return nil, errors.New("torrent closed")
+	case <-ctx.Done():
+		t.Drop()
+		return nil, ctx.Err()
 	case <-time.After(1 * time.Minute):
 		t.Drop()
 		return nil, errors.New("timeout waiting for torrent info")
@@ -407,12 +523,83 @@ func (c *Client) RemoveTorrent(infoHash string) error {
 	torrents := c.torrentClient.MustGet().Torrents()
 	for _, t := range torrents {
 		if t.InfoHash().AsString() == infoHash {
+			droppedHash := t.InfoHash()
 			t.Drop()
+			c.removeTorrentFiles(droppedHash)
 			c.repository.logger.Debug().Msgf("torrentstream: Removed torrent: %s", infoHash)
 			return nil
 		}
 	}
 	return fmt.Errorf("no torrent found")
+}
+
+func (c *Client) removeTorrentFiles(infoHash metainfo.Hash) {
+	if c.repository.settings.IsAbsent() {
+		return
+	}
+
+	torrentDir := path.Join(c.repository.settings.MustGet().DownloadDir, infoHash.HexString())
+	if err := os.RemoveAll(torrentDir); err != nil {
+		c.repository.logger.Warn().Err(err).Str("path", torrentDir).Msg("torrentstream: Failed to remove torrent files")
+	}
+}
+
+func (c *Client) torrentFilePath(t *torrent.Torrent, file *torrent.File) (string, bool) {
+	if c.repository.settings.IsAbsent() || t == nil || file == nil {
+		return "", false
+	}
+
+	return filepath.Join(c.repository.settings.MustGet().DownloadDir, t.InfoHash().HexString(), filepath.FromSlash(file.Path())), true
+}
+
+func (c *Client) cleanupTorrentFiles(t *torrent.Torrent, keepFiles ...*torrent.File) {
+	if c.repository.settings.IsAbsent() || t == nil {
+		return
+	}
+
+	keepPaths := make(map[string]struct{}, len(keepFiles))
+	for _, file := range keepFiles {
+		filePath, ok := c.torrentFilePath(t, file)
+		if ok {
+			keepPaths[filePath] = struct{}{}
+		}
+	}
+
+	deprioritized := 0
+	for _, file := range t.Files() {
+		filePath, ok := c.torrentFilePath(t, file)
+		if !ok {
+			continue
+		}
+		if _, keep := keepPaths[filePath]; keep {
+			continue
+		}
+
+		file.SetPriority(torrent.PiecePriorityNone)
+		deprioritized++
+	}
+
+	if deprioritized > 0 {
+		c.repository.logger.Debug().Str("infoHash", t.InfoHash().HexString()).Int("deprioritized", deprioritized).Msg("torrentstream: Deprioritized inactive torrent files")
+	}
+}
+
+func (c *Client) cleanupActiveTorrentFiles() {
+	if c.currentTorrent.IsPresent() && c.currentFile.IsPresent() {
+		currentTorrent := c.currentTorrent.MustGet()
+		keepFiles := []*torrent.File{c.currentFile.MustGet()}
+		if prepared, ok := c.repository.preloadedStream.Get(); ok && prepared.Torrent.InfoHash() == currentTorrent.InfoHash() {
+			keepFiles = append(keepFiles, prepared.File)
+		}
+		c.cleanupTorrentFiles(currentTorrent, keepFiles...)
+	}
+
+	if prepared, ok := c.repository.preloadedStream.Get(); ok {
+		if c.currentTorrent.IsPresent() && c.currentTorrent.MustGet().InfoHash() == prepared.Torrent.InfoHash() {
+			return
+		}
+		c.cleanupTorrentFiles(prepared.Torrent, prepared.File)
+	}
 }
 
 func (c *Client) dropTorrents() {
@@ -440,14 +627,17 @@ func (c *Client) dropTorrents() {
 	c.repository.logger.Debug().Msg("torrentstream: Dropped all torrents")
 }
 
-// dropExcessTorrents drops all torrents except the current stream and prepared stream
-func (c *Client) dropExcessTorrents() {
+// dropExcessTorrents drops all torrents except the current stream, prepared stream, and explicit keep hashes.
+func (c *Client) dropExcessTorrents(keep ...metainfo.Hash) {
 	if c.torrentClient.IsAbsent() {
 		return
 	}
 
 	// Collect info hashes we want to keep
 	keepHashes := make(map[metainfo.Hash]bool)
+	for _, hash := range keep {
+		keepHashes[hash] = true
+	}
 
 	// Keep current torrent
 	if c.currentTorrent.IsPresent() {
@@ -469,11 +659,7 @@ func (c *Client) dropExcessTorrents() {
 			t.Drop()
 			droppedCount++
 
-			// Also remove its directory
-			if c.repository.settings.IsPresent() {
-				torrentDir := path.Join(c.repository.settings.MustGet().DownloadDir, t.Name())
-				_ = os.RemoveAll(torrentDir)
-			}
+			c.removeTorrentFiles(infoHash)
 		}
 	}
 
@@ -498,42 +684,86 @@ func (c *Client) getTorrentPercentage(t mo.Option[*torrent.Torrent], f mo.Option
 	return float64(f.MustGet().BytesCompleted()) / float64(f.MustGet().Length()) * 100
 }
 
-// readyToStream determines if enough of the file has been downloaded to begin streaming
-// Uses both absolute size (minimum buffer) and a percentage-based approach
+// readyToStream determines if enough of the file has been downloaded to begin streaming.
+// Requires the first contiguous playback window to be complete.
 func (c *Client) readyToStream() bool {
 	if c.currentTorrent.IsAbsent() || c.currentFile.IsAbsent() {
 		return false
 	}
 
 	file := c.currentFile.MustGet()
+	torrent := c.currentTorrent.MustGet()
 
-	// Always need at least 1MB to start playback (typical header size for many formats)
-	const minimumBufferBytes int64 = 1 * 1024 * 1024 // 1MB
+	// If metadata/info is not loaded yet, fallback to aggregate check
+	if torrent.Info() == nil {
+		const minBuffBytes int64 = 1 * 1024 * 1024 // 1MB
+		return file.BytesCompleted() >= minBuffBytes
+	}
 
-	// For large files, use a smaller percentage
-	var percentThreshold float64
+	pieceLen := torrent.Info().PieceLength
+	if pieceLen <= 0 {
+		const minBuffBytes int64 = 1 * 1024 * 1024 // 1MB
+		return file.BytesCompleted() >= minBuffBytes
+	}
+
+	fileOffset := file.Offset()
 	fileSize := file.Length()
 	if fileSize == 0 {
 		return false
 	}
 
-	bytesCompleted := file.BytesCompleted()
-
-	if bytesCompleted == fileSize {
+	if file.BytesCompleted() == fileSize {
 		return true
 	}
 
-	switch {
-	case fileSize > 5*1024*1024*1024: // > 5GB
-		percentThreshold = 0.1 // 0.1% for very large files
-	case fileSize > 1024*1024*1024: // > 1GB
-		percentThreshold = 0.5 // 0.5% for large files
-	default:
-		percentThreshold = 0.5 // 0.5% for smaller files
+	// Calculate the starting piece index of the file
+	firstPieceIdx := fileOffset / pieceLen
+	fileLastPieceIdx := (fileOffset + fileSize - 1) / pieceLen
+
+	// Determine how many contiguous pieces we need from the start of the file.
+	// - If piece size is >= 2 MiB, require 1 piece
+	// - If piece size is < 2 MiB, require 2 pieces
+	var numRequiredPieces int64 = 2
+	if pieceLen >= 2*1024*1024 {
+		numRequiredPieces = 1
 	}
 
-	percentCompleted := float64(bytesCompleted) / float64(fileSize) * 100
+	// Calculate the piece index that ends the check range
+	endPieceIdx := firstPieceIdx + numRequiredPieces - 1
+	if endPieceIdx > fileLastPieceIdx {
+		endPieceIdx = fileLastPieceIdx
+	}
 
-	// Ready when both minimum buffer is met AND percentage threshold is reached
-	return bytesCompleted >= minimumBufferBytes && percentCompleted >= percentThreshold
+	if firstPieceIdx < 0 || endPieceIdx >= int64(torrent.NumPieces()) {
+		return false
+	}
+
+	// Check if all pieces in the range are complete
+	for idx := firstPieceIdx; idx <= endPieceIdx; idx++ {
+		if !torrent.Piece(int(idx)).State().Complete {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (c *Client) ResetBaselines() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.currentTorrent.IsPresent() {
+		t := c.currentTorrent.MustGet()
+		stats := t.Stats()
+		c.lastBytesReadUseful = stats.BytesReadUsefulData.Int64()
+		c.lastBytesWrittenData = stats.BytesWrittenData.Int64()
+		c.lastBytesCompleted = 0
+		if c.currentFile.IsPresent() {
+			c.lastBytesCompleted = c.currentFile.MustGet().BytesCompleted()
+		}
+	} else {
+		c.lastBytesReadUseful = 0
+		c.lastBytesWrittenData = 0
+		c.lastBytesCompleted = 0
+	}
+	c.lastSpeedCheck = time.Now()
 }

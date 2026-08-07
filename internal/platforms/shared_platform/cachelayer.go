@@ -341,9 +341,8 @@ func (c *CacheLayer) checkAndUpdateWorkingState(err error) {
 			return
 		}
 
-		errStr := strings.ToLower(err.Error())
 		// handle invalid token
-		if strings.Contains(errStr, "user not found") {
+		if isAnilistAuthError(err) {
 			events.GlobalWSEventManager.SendEvent(events.ServerLoggedOutAnilist, "Your AniList session has expired. Please log in again.")
 			if c.logoutFunc != nil {
 				go c.logoutFunc()
@@ -384,6 +383,15 @@ func (c *CacheLayer) checkAndUpdateWorkingState(err error) {
 		}
 		clearFailureTracking()
 	}
+}
+
+func isAnilistAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "invalid token") || strings.Contains(errStr, "user not found")
 }
 
 // generateCacheKey generates a cache key from the given parameters
@@ -972,7 +980,7 @@ func (c *CacheLayer) UpdateMediaListEntry(ctx context.Context, mediaID *int, sta
 		return &anilist.UpdateMediaListEntry{SaveMediaListEntry: &anilist.UpdateMediaListEntry_SaveMediaListEntry{ID: entryID}}, nil
 	}
 
-	res, err := c.anilistClientRef.Get().UpdateMediaListEntry(ctx, mediaID, status, scoreRaw, progress, startedAt, completedAt, interceptors...)
+	res, err := c.sendMediaListEntryUpdate(ctx, mediaID, status, scoreRaw, progress, startedAt, completedAt, interceptors...)
 	c.checkAndUpdateWorkingState(err)
 	if err != nil && shouldQueueMediaListUpdate(err) {
 		entryID, queueErr := c.queueMediaListEntryUpdate(mediaID, status, scoreRaw, progress, startedAt, completedAt)
@@ -1001,7 +1009,7 @@ func (c *CacheLayer) UpdateMediaListEntryProgress(ctx context.Context, mediaID *
 		return &anilist.UpdateMediaListEntryProgress{SaveMediaListEntry: &anilist.UpdateMediaListEntryProgress_SaveMediaListEntry{ID: entryID}}, nil
 	}
 
-	res, err := c.anilistClientRef.Get().UpdateMediaListEntryProgress(ctx, mediaID, progress, status, interceptors...)
+	res, err := c.sendMediaListEntryProgressUpdate(ctx, mediaID, progress, status, interceptors...)
 	c.checkAndUpdateWorkingState(err)
 	if err != nil && shouldQueueMediaListUpdate(err) {
 		entryID, queueErr := c.queueMediaListEntryProgressUpdate(mediaID, progress, status)

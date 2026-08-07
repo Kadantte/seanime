@@ -14,6 +14,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as MainRouteImport } from './routes/_main'
 import { Route as SplashscreenIndexRouteImport } from './routes/splashscreen/index'
 import { Route as MainIndexRouteImport } from './routes/_main/index'
+import { Route as MainTestRouteImport } from './routes/_main/test'
 import { Route as MainErrorTestRouteImport } from './routes/_main/error-test'
 import { Route as SplashscreenCrashIndexRouteImport } from './routes/splashscreen/crash/index'
 import { Route as PublicAuthIndexRouteImport } from './routes/public/auth/index'
@@ -37,6 +38,9 @@ const DocsIndexLazyRouteImport = createFileRoute('/docs/')()
 const MainWebviewIndexLazyRouteImport = createFileRoute('/_main/webview/')()
 const MainTorrentListIndexLazyRouteImport = createFileRoute(
   '/_main/torrent-list/',
+)()
+const MainTorrentClientIndexLazyRouteImport = createFileRoute(
+  '/_main/torrent-client/',
 )()
 const MainSyncIndexLazyRouteImport = createFileRoute('/_main/sync/')()
 const MainScheduleIndexLazyRouteImport = createFileRoute('/_main/schedule/')()
@@ -92,6 +96,11 @@ const MainIndexRoute = MainIndexRouteImport.update({
   path: '/',
   getParentRoute: () => MainRoute,
 } as any)
+const MainTestRoute = MainTestRouteImport.update({
+  id: '/test',
+  path: '/test',
+  getParentRoute: () => MainRoute,
+} as any)
 const MainErrorTestRoute = MainErrorTestRouteImport.update({
   id: '/error-test',
   path: '/error-test',
@@ -111,6 +120,14 @@ const MainTorrentListIndexLazyRoute =
     getParentRoute: () => MainRoute,
   } as any).lazy(() =>
     import('./routes/_main/torrent-list/index.lazy').then((d) => d.Route),
+  )
+const MainTorrentClientIndexLazyRoute =
+  MainTorrentClientIndexLazyRouteImport.update({
+    id: '/torrent-client/',
+    path: '/torrent-client/',
+    getParentRoute: () => MainRoute,
+  } as any).lazy(() =>
+    import('./routes/_main/torrent-client/index.lazy').then((d) => d.Route),
   )
 const MainSyncIndexLazyRoute = MainSyncIndexLazyRouteImport.update({
   id: '/sync/',
@@ -296,6 +313,7 @@ const MainOfflineEntryAnimeIndexRoute =
 export interface FileRoutesByFullPath {
   '/': typeof MainIndexRoute
   '/error-test': typeof MainErrorTestRoute
+  '/test': typeof MainTestRoute
   '/splashscreen/': typeof SplashscreenIndexRoute
   '/docs/': typeof DocsIndexLazyRoute
   '/issue-report/': typeof IssueReportIndexLazyRoute
@@ -319,6 +337,7 @@ export interface FileRoutesByFullPath {
   '/scan-summaries/': typeof MainScanSummariesIndexLazyRoute
   '/schedule/': typeof MainScheduleIndexLazyRoute
   '/sync/': typeof MainSyncIndexLazyRoute
+  '/torrent-client/': typeof MainTorrentClientIndexLazyRoute
   '/torrent-list/': typeof MainTorrentListIndexLazyRoute
   '/webview/': typeof MainWebviewIndexLazyRoute
   '/auth/callback/': typeof MainAuthCallbackIndexRoute
@@ -330,6 +349,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/error-test': typeof MainErrorTestRoute
+  '/test': typeof MainTestRoute
   '/': typeof MainIndexRoute
   '/splashscreen': typeof SplashscreenIndexRoute
   '/docs': typeof DocsIndexLazyRoute
@@ -354,6 +374,7 @@ export interface FileRoutesByTo {
   '/scan-summaries': typeof MainScanSummariesIndexLazyRoute
   '/schedule': typeof MainScheduleIndexLazyRoute
   '/sync': typeof MainSyncIndexLazyRoute
+  '/torrent-client': typeof MainTorrentClientIndexLazyRoute
   '/torrent-list': typeof MainTorrentListIndexLazyRoute
   '/webview': typeof MainWebviewIndexLazyRoute
   '/auth/callback': typeof MainAuthCallbackIndexRoute
@@ -367,6 +388,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_main': typeof MainRouteWithChildren
   '/_main/error-test': typeof MainErrorTestRoute
+  '/_main/test': typeof MainTestRoute
   '/_main/': typeof MainIndexRoute
   '/splashscreen/': typeof SplashscreenIndexRoute
   '/docs/': typeof DocsIndexLazyRoute
@@ -391,6 +413,7 @@ export interface FileRoutesById {
   '/_main/scan-summaries/': typeof MainScanSummariesIndexLazyRoute
   '/_main/schedule/': typeof MainScheduleIndexLazyRoute
   '/_main/sync/': typeof MainSyncIndexLazyRoute
+  '/_main/torrent-client/': typeof MainTorrentClientIndexLazyRoute
   '/_main/torrent-list/': typeof MainTorrentListIndexLazyRoute
   '/_main/webview/': typeof MainWebviewIndexLazyRoute
   '/_main/auth/callback/': typeof MainAuthCallbackIndexRoute
@@ -405,6 +428,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/error-test'
+    | '/test'
     | '/splashscreen/'
     | '/docs/'
     | '/issue-report/'
@@ -428,6 +452,7 @@ export interface FileRouteTypes {
     | '/scan-summaries/'
     | '/schedule/'
     | '/sync/'
+    | '/torrent-client/'
     | '/torrent-list/'
     | '/webview/'
     | '/auth/callback/'
@@ -439,6 +464,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/error-test'
+    | '/test'
     | '/'
     | '/splashscreen'
     | '/docs'
@@ -463,6 +489,7 @@ export interface FileRouteTypes {
     | '/scan-summaries'
     | '/schedule'
     | '/sync'
+    | '/torrent-client'
     | '/torrent-list'
     | '/webview'
     | '/auth/callback'
@@ -475,6 +502,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_main'
     | '/_main/error-test'
+    | '/_main/test'
     | '/_main/'
     | '/splashscreen/'
     | '/docs/'
@@ -499,6 +527,7 @@ export interface FileRouteTypes {
     | '/_main/scan-summaries/'
     | '/_main/schedule/'
     | '/_main/sync/'
+    | '/_main/torrent-client/'
     | '/_main/torrent-list/'
     | '/_main/webview/'
     | '/_main/auth/callback/'
@@ -563,6 +592,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof MainIndexRouteImport
       parentRoute: typeof MainRoute
     }
+    '/_main/test': {
+      id: '/_main/test'
+      path: '/test'
+      fullPath: '/test'
+      preLoaderRoute: typeof MainTestRouteImport
+      parentRoute: typeof MainRoute
+    }
     '/_main/error-test': {
       id: '/_main/error-test'
       path: '/error-test'
@@ -582,6 +618,13 @@ declare module '@tanstack/react-router' {
       path: '/torrent-list'
       fullPath: '/torrent-list/'
       preLoaderRoute: typeof MainTorrentListIndexLazyRouteImport
+      parentRoute: typeof MainRoute
+    }
+    '/_main/torrent-client/': {
+      id: '/_main/torrent-client/'
+      path: '/torrent-client'
+      fullPath: '/torrent-client/'
+      preLoaderRoute: typeof MainTorrentClientIndexLazyRouteImport
       parentRoute: typeof MainRoute
     }
     '/_main/sync/': {
@@ -764,6 +807,7 @@ declare module '@tanstack/react-router' {
 
 interface MainRouteChildren {
   MainErrorTestRoute: typeof MainErrorTestRoute
+  MainTestRoute: typeof MainTestRoute
   MainIndexRoute: typeof MainIndexRoute
   MainCustomSourcesIndexRoute: typeof MainCustomSourcesIndexRoute
   MainDiscoverIndexRoute: typeof MainDiscoverIndexRoute
@@ -782,6 +826,7 @@ interface MainRouteChildren {
   MainScanSummariesIndexLazyRoute: typeof MainScanSummariesIndexLazyRoute
   MainScheduleIndexLazyRoute: typeof MainScheduleIndexLazyRoute
   MainSyncIndexLazyRoute: typeof MainSyncIndexLazyRoute
+  MainTorrentClientIndexLazyRoute: typeof MainTorrentClientIndexLazyRoute
   MainTorrentListIndexLazyRoute: typeof MainTorrentListIndexLazyRoute
   MainWebviewIndexLazyRoute: typeof MainWebviewIndexLazyRoute
   MainAuthCallbackIndexRoute: typeof MainAuthCallbackIndexRoute
@@ -794,6 +839,7 @@ interface MainRouteChildren {
 
 const MainRouteChildren: MainRouteChildren = {
   MainErrorTestRoute: MainErrorTestRoute,
+  MainTestRoute: MainTestRoute,
   MainIndexRoute: MainIndexRoute,
   MainCustomSourcesIndexRoute: MainCustomSourcesIndexRoute,
   MainDiscoverIndexRoute: MainDiscoverIndexRoute,
@@ -812,6 +858,7 @@ const MainRouteChildren: MainRouteChildren = {
   MainScanSummariesIndexLazyRoute: MainScanSummariesIndexLazyRoute,
   MainScheduleIndexLazyRoute: MainScheduleIndexLazyRoute,
   MainSyncIndexLazyRoute: MainSyncIndexLazyRoute,
+  MainTorrentClientIndexLazyRoute: MainTorrentClientIndexLazyRoute,
   MainTorrentListIndexLazyRoute: MainTorrentListIndexLazyRoute,
   MainWebviewIndexLazyRoute: MainWebviewIndexLazyRoute,
   MainAuthCallbackIndexRoute: MainAuthCallbackIndexRoute,

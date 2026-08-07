@@ -2,12 +2,7 @@ package torrent
 
 import (
 	"context"
-	"sync"
-	"testing"
-
-	"github.com/rs/zerolog"
-	"github.com/stretchr/testify/require"
-
+	"seanime/internal/api/anilist"
 	"seanime/internal/api/metadata"
 	"seanime/internal/api/metadata_provider"
 	"seanime/internal/extension"
@@ -16,6 +11,12 @@ import (
 	"seanime/internal/hook_resolver"
 	"seanime/internal/testmocks"
 	"seanime/internal/util"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/require"
 )
 
 func useTestHookManager(t *testing.T) hook.Manager {
@@ -70,6 +71,17 @@ func TestRepositoryProviderSelectionWithoutProviders(t *testing.T) {
 	require.Nil(t, ext)
 
 	ext, ok = repo.GetAnimeProviderExtensionOrFirst("missing")
+	require.False(t, ok)
+	require.Nil(t, ext)
+}
+
+func TestSelectedProviderDoesNotFallback(t *testing.T) {
+	repo := newTorrentRepositoryForTests(map[string]*stubAnimeProvider{
+		"main": newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{Type: hibiketorrent.AnimeProviderTypeMain}),
+	}, testmocks.NewFakeMetadataProviderBuilder().Build())
+	repo.SetSettings(&RepositorySettings{DefaultAnimeProvider: ProviderNone})
+
+	ext, ok := repo.GetSelectedAnimeProviderExtension()
 	require.False(t, ok)
 	require.Nil(t, ext)
 }
@@ -207,8 +219,56 @@ func TestSearchAnimeAppliesSearchHookBeforeCaching(t *testing.T) {
 	require.Equal(t, 1, hookCalls)
 }
 
-func TestSearchAnimeSmartUsesMetadataAndSpecialProviders(t *testing.T) {
+func TestSearchAnimeFreshUpdatesCache(t *testing.T) {
 	metadataCache.Clear()
+	provider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{Type: hibiketorrent.AnimeProviderTypeMain})
+	provider.searchResults = []*hibiketorrent.AnimeTorrent{{
+		Name:     "[Provider] Example Show - 01.mkv",
+		InfoHash: "old-hash",
+	}}
+	repo := newTorrentRepositoryForTests(map[string]*stubAnimeProvider{"main": provider}, testmocks.NewFakeMetadataProviderBuilder().Build())
+	repo.SetSettings(&RepositorySettings{DefaultAnimeProvider: "main"})
+
+	media := testmocks.NewBaseAnime(103, "Example Show")
+	opts := AnimeSearchOptions{
+		Provider: "main",
+		Type:     AnimeSearchTypeSimple,
+		Media:    media,
+		Query:    "Example Show",
+	}
+
+	_, err := repo.SearchAnime(context.Background(), opts)
+	require.NoError(t, err)
+
+	provider.searchResults = []*hibiketorrent.AnimeTorrent{{
+		Name:     "[Provider] Example Show - 02.mkv",
+		InfoHash: "new-hash",
+	}}
+	fresh, err := repo.SearchAnimeFresh(context.Background(), opts)
+	require.NoError(t, err)
+	require.Equal(t, "new-hash", fresh.Torrents[0].InfoHash)
+
+	provider.searchResults = nil
+	cached, err := repo.SearchAnime(context.Background(), opts)
+	require.NoError(t, err)
+	require.Equal(t, "new-hash", cached.Torrents[0].InfoHash)
+	require.Equal(t, 2, provider.searchCallsCount())
+}
+
+func TestSearchCacheTTL(t *testing.T) {
+	finished := testmocks.NewBaseAnime(104, "Finished Show")
+	releasing := testmocks.NewBaseAnimeBuilder(105, "Releasing Show").WithStatus(anilist.MediaStatusReleasing).Build()
+	result := &SearchData{Torrents: []*hibiketorrent.AnimeTorrent{{InfoHash: "hash"}}}
+
+	require.Equal(t, searchMissTTL, searchCacheTTL(&SearchData{}, AnimeSearchOptions{Media: finished, Type: AnimeSearchTypeSimple}))
+	require.Equal(t, searchMissTTL, searchCacheTTL(result, AnimeSearchOptions{Media: releasing, Type: AnimeSearchTypeSmart}))
+	require.Equal(t, releasingSearchTTL, searchCacheTTL(result, AnimeSearchOptions{Media: releasing, Type: AnimeSearchTypeSmart, SkipPreviews: true}))
+	require.Equal(t, 30*time.Minute, searchCacheTTL(result, AnimeSearchOptions{Media: finished, Type: AnimeSearchTypeSimple}))
+}
+
+func TestSearchAnimeSmartSearchesRequestedProviders(t *testing.T) {
+	metadataCache.Clear()
+	// extra providers are only searched when they are explicitly requested
 	mainProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
 		Type:           hibiketorrent.AnimeProviderTypeMain,
 		CanSmartSearch: true,
@@ -241,6 +301,16 @@ func TestSearchAnimeSmartUsesMetadataAndSpecialProviders(t *testing.T) {
 		Seeders:  8,
 		IsBatch:  true,
 	}}
+	unusedSpecialProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
+		Type:           hibiketorrent.AnimeProviderTypeSpecial,
+		CanSmartSearch: true,
+	})
+	unusedSpecialProvider.smartResults = []*hibiketorrent.AnimeTorrent{{
+		Name:     "[UnusedSpecial] Example Show Batch (1080p).mkv",
+		InfoHash: "unused-special-hash",
+		Seeders:  30,
+		IsBatch:  true,
+	}}
 
 	fakeMetadata := testmocks.NewFakeMetadataProviderBuilder().WithAnimeMetadata(200, &metadata.AnimeMetadata{
 		Episodes: map[string]*metadata.EpisodeMetadata{
@@ -254,12 +324,13 @@ func TestSearchAnimeSmartUsesMetadataAndSpecialProviders(t *testing.T) {
 		"main":           mainProvider,
 		"special-simple": specialSimpleProvider,
 		"special-smart":  specialSmartProvider,
+		"special-unused": unusedSpecialProvider,
 	}, fakeMetadata)
 
 	media := testmocks.NewBaseAnimeBuilder(200, "Example Show").WithEpisodes(24).Build()
 
 	result, err := repo.SearchAnime(context.Background(), AnimeSearchOptions{
-		Provider:                "main",
+		Provider:                "main,special-simple,special-smart",
 		Type:                    AnimeSearchTypeSmart,
 		Media:                   media,
 		Query:                   "Example Show",
@@ -275,6 +346,7 @@ func TestSearchAnimeSmartUsesMetadataAndSpecialProviders(t *testing.T) {
 	require.Equal(t, 1, specialSimpleProvider.searchCallsCount())
 	require.Equal(t, 0, specialSimpleProvider.smartCallsCount())
 	require.Equal(t, 1, specialSmartProvider.smartCallsCount())
+	require.Equal(t, 0, unusedSpecialProvider.smartCallsCount())
 	require.Equal(t, 1, fakeMetadata.MetadataCalls(media.ID))
 	require.ElementsMatch(t, []string{"special-simple", "special-smart"}, result.IncludedSpecialProviders)
 	require.Len(t, result.Torrents, 3)
@@ -290,6 +362,56 @@ func TestSearchAnimeSmartUsesMetadataAndSpecialProviders(t *testing.T) {
 	require.Equal(t, 12, lastSmart.Media.AbsoluteSeasonOffset)
 	require.Equal(t, 5, lastSmart.EpisodeNumber)
 	require.Equal(t, "Example Show", lastSmart.Query)
+}
+
+func TestSearchAnimeIgnoresIncludeSpecialProviders(t *testing.T) {
+	metadataCache.Clear()
+	// legacy includeSpecialProviders stays accepted but no longer adds providers
+	mainProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
+		Type:           hibiketorrent.AnimeProviderTypeMain,
+		CanSmartSearch: true,
+	})
+	mainProvider.smartResults = []*hibiketorrent.AnimeTorrent{{
+		Name:          "[Main] Example Show - 05 (1080p).mkv",
+		InfoHash:      "main-hash",
+		Seeders:       20,
+		EpisodeNumber: 5,
+	}}
+
+	specialProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
+		Type:           hibiketorrent.AnimeProviderTypeSpecial,
+		CanSmartSearch: true,
+	})
+	specialProvider.smartResults = []*hibiketorrent.AnimeTorrent{{
+		Name:     "[Special] Example Show Batch (1080p).mkv",
+		InfoHash: "special-hash",
+		Seeders:  8,
+		IsBatch:  true,
+	}}
+
+	repo := newTorrentRepositoryForTests(map[string]*stubAnimeProvider{
+		"main":    mainProvider,
+		"special": specialProvider,
+	}, testmocks.NewFakeMetadataProviderBuilder().Build())
+
+	media := testmocks.NewBaseAnimeBuilder(201, "Example Show").WithEpisodes(24).Build()
+
+	result, err := repo.SearchAnime(context.Background(), AnimeSearchOptions{
+		Provider:                "main",
+		Type:                    AnimeSearchTypeSmart,
+		Media:                   media,
+		Query:                   "Example Show",
+		Batch:                   true,
+		EpisodeNumber:           5,
+		IncludeSpecialProviders: true,
+		SkipPreviews:            true,
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, mainProvider.smartCallsCount())
+	require.Equal(t, 0, specialProvider.smartCallsCount())
+	require.Empty(t, result.IncludedSpecialProviders)
+	require.Len(t, result.Torrents, 1)
 }
 
 func TestSearchAnimeErrorsWhenNoProviderExists(t *testing.T) {
@@ -386,7 +508,6 @@ func (s *stubAnimeProvider) lastSmartOptions() hibiketorrent.AnimeSmartSearchOpt
 }
 
 func newTorrentRepositoryForTests(providers map[string]*stubAnimeProvider, metadataProvider metadata_provider.Provider) *Repository {
-	logger := zerolog.Nop()
 	bank := extension.NewUnifiedBank()
 	for id, provider := range providers {
 		bank.Set(id, extension.NewAnimeTorrentProviderExtension(&extension.Extension{
@@ -400,7 +521,7 @@ func newTorrentRepositoryForTests(providers map[string]*stubAnimeProvider, metad
 	}
 
 	return NewRepository(&NewRepositoryOptions{
-		Logger:              &logger,
+		Logger:              new(zerolog.Nop()),
 		MetadataProviderRef: util.NewRef[metadata_provider.Provider](metadataProvider),
 		ExtensionBankRef:    util.NewRef(bank),
 	})
@@ -416,8 +537,89 @@ func cloneTorrents(in []*hibiketorrent.AnimeTorrent) []*hibiketorrent.AnimeTorre
 			out = append(out, nil)
 			continue
 		}
-		copyTorrent := *torrent
-		out = append(out, &copyTorrent)
+		out = append(out, new(*torrent))
 	}
 	return out
+}
+
+func TestSearchAnimeSkipPreviewsCacheRegression(t *testing.T) {
+	metadataCache.Clear()
+
+	mainProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
+		Type:           hibiketorrent.AnimeProviderTypeMain,
+		CanSmartSearch: true,
+	})
+	mainProvider.smartResults = []*hibiketorrent.AnimeTorrent{{
+		Name:          "[Main] Example Show - 05 (1080p).mkv",
+		InfoHash:      "main-hash",
+		Seeders:       20,
+		EpisodeNumber: 5,
+	}}
+
+	fakeMetadata := testmocks.NewFakeMetadataProviderBuilder().WithAnimeMetadata(200, &metadata.AnimeMetadata{
+		Episodes: map[string]*metadata.EpisodeMetadata{
+			"5": {Episode: "5", AnidbEid: 505},
+		},
+		Mappings: &metadata.AnimeMappings{AnidbId: 1001},
+	}).Build()
+
+	repo := newTorrentRepositoryForTests(map[string]*stubAnimeProvider{
+		"main": mainProvider,
+	}, fakeMetadata)
+	repo.SetSettings(&RepositorySettings{DefaultAnimeProvider: "main"})
+
+	media := testmocks.NewBaseAnimeBuilder(200, "Example Show").WithEpisodes(24).Build()
+
+	// first search with SkipPreviews = true (e.g. autoselect)
+	result1, err := repo.SearchAnime(context.Background(), AnimeSearchOptions{
+		Provider:      "main",
+		Type:          AnimeSearchTypeSmart,
+		Media:         media,
+		Query:         "Example Show",
+		EpisodeNumber: 5,
+		SkipPreviews:  true,
+	})
+	require.NoError(t, err)
+	require.Empty(t, result1.Previews)
+
+	// second search with SkipPreviews = false
+	result2, err := repo.SearchAnime(context.Background(), AnimeSearchOptions{
+		Provider:      "main",
+		Type:          AnimeSearchTypeSmart,
+		Media:         media,
+		Query:         "Example Show",
+		EpisodeNumber: 5,
+		SkipPreviews:  false,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, result2.Previews)
+}
+
+func TestSearchAnimeEmptyTypeNoCacheCollision(t *testing.T) {
+	metadataCache.Clear()
+
+	mainProvider := newStubAnimeProvider(hibiketorrent.AnimeProviderSettings{
+		Type:           hibiketorrent.AnimeProviderTypeMain,
+		CanSmartSearch: false,
+	})
+
+	repo := newTorrentRepositoryForTests(map[string]*stubAnimeProvider{
+		"main": mainProvider,
+	}, testmocks.NewFakeMetadataProviderBuilder().Build())
+	repo.SetSettings(&RepositorySettings{DefaultAnimeProvider: "main"})
+
+	mediaA := testmocks.NewBaseAnimeBuilder(301, "Show A").Build()
+
+	_, err := repo.SearchAnime(context.Background(), AnimeSearchOptions{
+		Provider: "main",
+		Type:     "", // no type
+		Media:    mediaA,
+		Query:    "Show A",
+	})
+	require.NoError(t, err)
+
+	// verify that nothing was cached under the empty key ""
+	cache := getAnimeSearchCache(repo.animeProviderSearchCaches, "main")
+	_, found := cache.Get("")
+	require.False(t, found)
 }

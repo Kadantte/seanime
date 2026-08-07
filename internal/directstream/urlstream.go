@@ -7,7 +7,7 @@ import (
 	"seanime/internal/api/anilist"
 	"seanime/internal/library/anime"
 	"seanime/internal/mkvparser"
-	"seanime/internal/nativeplayer"
+	"seanime/internal/player"
 	"seanime/internal/util/result"
 )
 
@@ -22,11 +22,11 @@ type UrlStream struct {
 	httpBaseStream
 }
 
-func (s *UrlStream) Type() nativeplayer.StreamType {
-	return nativeplayer.StreamTypeURL
+func (s *UrlStream) Type() player.PlaybackType {
+	return player.PlaybackTypeURL
 }
 
-func (s *UrlStream) LoadPlaybackInfo() (*nativeplayer.PlaybackInfo, error) {
+func (s *UrlStream) LoadPlaybackInfo() (*player.PlaybackInfo, error) {
 	return s.httpBaseStream.loadPlaybackInfo(s.Type())
 }
 
@@ -46,8 +46,15 @@ type PlayUrlStreamOptions struct {
 }
 
 // PlayUrlStream starts built-in player playback for an arbitrary HTTP URL with progress tracking.
-func (m *Manager) PlayUrlStream(ctx context.Context, opts PlayUrlStreamOptions) error {
-	m.ResetOpenState(opts.ClientId)
+func (m *Manager) PlayUrlStream(ctx context.Context, opts PlayUrlStreamOptions) (err error) {
+	if !m.BeginOpen(opts.ClientId, "Loading stream...", nil) {
+		return fmt.Errorf("stream opening was cancelled")
+	}
+	defer func() {
+		if err != nil {
+			m.AbortOpen(opts.ClientId, err)
+		}
+	}()
 
 	episodeCollection, err := anime.NewEpisodeCollection(anime.NewEpisodeCollectionOptions{
 		AnimeMetadata:       nil,

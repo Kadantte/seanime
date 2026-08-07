@@ -127,6 +127,17 @@ func (u *UI) Destroyed() <-chan struct{} {
 	return u.destroyedCh
 }
 
+func (u *UI) ListAnimeEntryEpisodeTabs() []*EpisodeTabItem {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	if u.destroyed || u.context == nil || u.context.episodeTabManager == nil {
+		return nil
+	}
+
+	return u.context.episodeTabManager.ListTabs()
+}
+
 // signalDestroyed tells the plugin that the UI has been destroyed.
 // This is used to interrupt the Plugin when the UI is stopped
 // TODO: FIX
@@ -194,6 +205,8 @@ func (u *UI) Register(callback string) error {
 	u.context.actionManager.renderAnimePageDropdownItems()
 	u.context.actionManager.renderAnimeLibraryDropdownItems()
 	u.context.actionManager.renderMangaPageButtons()
+	u.context.actionManager.renderMangaPageDropdownItems()
+	u.context.actionManager.renderMangaLibraryDropdownItems()
 	u.context.actionManager.renderMediaCardContextMenuItems()
 	u.context.actionManager.renderEpisodeCardContextMenuItems()
 	u.context.actionManager.renderEpisodeGridItemMenuItems()
@@ -277,6 +290,12 @@ func (u *UI) dispatchClientEvent(clientEvent *ClientPluginEvent) {
 
 	case ClientActionRenderMangaPageButtonsEvent: // Client wants to update the manga page buttons
 		u.context.actionManager.renderMangaPageButtons()
+
+	case ClientActionRenderMangaPageDropdownItemsEvent: // Client wants to update the manga page dropdown items
+		u.context.actionManager.renderMangaPageDropdownItems()
+
+	case ClientActionRenderMangaLibraryDropdownItemsEvent: // Client wants to update the manga library dropdown items
+		u.context.actionManager.renderMangaLibraryDropdownItems()
 
 	case ClientActionRenderMediaCardContextMenuItemsEvent: // Client wants to update the media card context menu items
 		u.context.actionManager.renderMediaCardContextMenuItems()

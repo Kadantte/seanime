@@ -8,7 +8,7 @@ import (
 	hibiketorrent "seanime/internal/extension/hibike/torrent"
 	"seanime/internal/library/anime"
 	"seanime/internal/mkvparser"
-	"seanime/internal/nativeplayer"
+	"seanime/internal/player"
 	"seanime/internal/util/result"
 )
 
@@ -25,11 +25,11 @@ type Nakama struct {
 	streamReadyCh chan struct{} // Closed by the initiator when the stream is ready
 }
 
-func (s *Nakama) Type() nativeplayer.StreamType {
-	return nativeplayer.StreamTypeNakama
+func (s *Nakama) Type() player.PlaybackType {
+	return player.PlaybackTypeNakama
 }
 
-func (s *Nakama) LoadPlaybackInfo() (*nativeplayer.PlaybackInfo, error) {
+func (s *Nakama) LoadPlaybackInfo() (*player.PlaybackInfo, error) {
 	return s.httpBaseStream.loadPlaybackInfo(s.Type())
 }
 
@@ -51,8 +51,15 @@ type PlayNakamaStreamOptions struct {
 }
 
 // PlayNakamaStream is used by a module to load a new nakama stream.
-func (m *Manager) PlayNakamaStream(ctx context.Context, opts PlayNakamaStreamOptions) error {
-	m.ResetOpenState(opts.ClientId)
+func (m *Manager) PlayNakamaStream(ctx context.Context, opts PlayNakamaStreamOptions) (err error) {
+	if !m.BeginOpen(opts.ClientId, "Loading stream...", nil) {
+		return fmt.Errorf("stream opening was cancelled")
+	}
+	defer func() {
+		if err != nil {
+			m.AbortOpen(opts.ClientId, err)
+		}
+	}()
 
 	episodeCollection, err := anime.NewEpisodeCollection(anime.NewEpisodeCollectionOptions{
 		AnimeMetadata:       nil,

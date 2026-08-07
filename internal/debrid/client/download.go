@@ -23,6 +23,13 @@ import (
 	"time"
 )
 
+var (
+	DownloadAttempts         = 3
+	DownloadRetryDelay       = func(n int) time.Duration { return time.Duration(n) * 2 * time.Second }
+	ErrDownloadAlreadyActive = errors.New("debrid: download already active")
+	isMobileDownload         = util.IsMobile
+)
+
 func (r *Repository) launchDownloadLoop(ctx context.Context) {
 	r.logger.Trace().Msg("debrid: Starting download loop")
 	go func() {
@@ -33,57 +40,63 @@ func (r *Repository) launchDownloadLoop(ctx context.Context) {
 				// Destroy the loop
 				return
 			case <-time.After(time.Minute * 1):
-				// Every minute, check if there are any completed downloads
 				provider, found := r.provider.Get()
 				if !found {
 					continue
 				}
 
-				// Get the list of completed downloads
-				items, err := provider.GetTorrents()
-				if err != nil {
-					r.logger.Err(err).Msg("debrid: Failed to get torrents")
-					continue
-				}
-
-				readyItems := make([]*debrid.TorrentItem, 0)
-				for _, item := range items {
-					if item.IsReady {
-						readyItems = append(readyItems, item)
-					}
-				}
-
-				dbItems, err := r.db.GetDebridTorrentItems()
-				if err != nil {
-					r.logger.Err(err).Msg("debrid: Failed to get debrid torrent items")
-					continue
-				}
-
-				for _, dbItem := range dbItems {
-					// Check if the item is ready for download
-					for _, readyItem := range readyItems {
-						if dbItem.TorrentItemID == readyItem.ID {
-							r.logger.Debug().Str("torrentItemId", dbItem.TorrentItemID).Msg("debrid: Torrent is ready for download")
-							// Remove the item from the database
-							err = r.db.DeleteDebridTorrentItemByDbId(dbItem.ID)
-							if err != nil {
-								r.logger.Err(err).Msg("debrid: Failed to remove debrid torrent item")
-								continue
-							}
-							time.Sleep(1 * time.Second)
-							// Download the torrent locally
-							err = r.downloadTorrentItem(readyItem.ID, readyItem.Name, dbItem.Destination)
-							if err != nil {
-								r.logger.Err(err).Msg("debrid: Failed to download torrent")
-								continue
-							}
-						}
-					}
-				}
+				r.processQueuedDownloads(provider)
 
 			}
 		}
 	}()
+}
+
+func (r *Repository) processQueuedDownloads(provider debrid.Provider) {
+	dbItems, err := r.db.GetDebridTorrentItems()
+	if err != nil {
+		r.logger.Err(err).Msg("debrid: Failed to get debrid torrent items")
+		return
+	}
+
+	providerId := provider.GetSettings().ID
+	for _, dbItem := range dbItems {
+		if dbItem.Provider != "" && dbItem.Provider != providerId {
+			continue
+		}
+		if r.ctxMap != nil {
+			if _, found := r.ctxMap.Get(dbItem.TorrentItemID); found {
+				continue
+			}
+		}
+
+		item, err := provider.GetTorrent(dbItem.TorrentItemID)
+		if err != nil {
+			r.logger.Err(err).Str("torrentItemId", dbItem.TorrentItemID).Msg("debrid: Failed to get queued torrent")
+			continue
+		}
+		if item == nil || !item.IsReady {
+			continue
+		}
+
+		r.logger.Debug().Str("torrentItemId", dbItem.TorrentItemID).Msg("debrid: Torrent is ready for download")
+		if err = r.downloadTorrentItemThen(item.ID, item.Name, dbItem.Destination, func(ok bool) {
+			if !ok {
+				return
+			}
+
+			if updateErr := r.db.MarkAutoDownloaderItemsDownloaded(dbItem.MediaId, item.Hash); updateErr != nil {
+				r.logger.Err(updateErr).Msg("debrid: Failed to update auto downloader item")
+			}
+
+			if deleteErr := r.db.DeleteDebridTorrentItemByDbId(dbItem.ID); deleteErr != nil {
+				r.logger.Err(deleteErr).Msg("debrid: Failed to remove debrid torrent item")
+			}
+		}); err != nil {
+			r.logger.Err(err).Msg("debrid: Failed to download torrent")
+			continue
+		}
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -98,7 +111,27 @@ type downloadStatus struct {
 }
 
 func (r *Repository) downloadTorrentItem(tId string, torrentName string, destination string) (err error) {
+	return r.downloadTorrentItemThen(tId, torrentName, destination, nil)
+}
+
+func (r *Repository) downloadTorrentItemThen(tId string, torrentName string, destination string, onDone func(bool)) (err error) {
 	defer util.HandlePanicInModuleWithError("debrid/client/downloadTorrentItem", &err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if r.ctxMap != nil {
+		if _, loaded := r.ctxMap.LoadOrStore(tId, cancel); loaded {
+			cancel()
+			return ErrDownloadAlreadyActive
+		}
+	}
+	defer func() {
+		if err != nil {
+			cancel()
+			if r.ctxMap != nil {
+				r.ctxMap.Delete(tId)
+			}
+		}
+	}()
 
 	provider, err := r.GetProvider()
 	if err != nil {
@@ -114,6 +147,9 @@ func (r *Repository) downloadTorrentItem(tId string, torrentName string, destina
 	if err != nil {
 		return err
 	}
+	if downloadUrl == "" {
+		return fmt.Errorf("debrid: download URL is empty")
+	}
 
 	event := &DebridLocalDownloadRequestedEvent{
 		TorrentName: torrentName,
@@ -127,14 +163,17 @@ func (r *Repository) downloadTorrentItem(tId string, torrentName string, destina
 
 	if event.DefaultPrevented {
 		r.logger.Debug().Msg("debrid: Download prevented by hook")
+		if onDone != nil {
+			onDone(true)
+		}
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	r.ctxMap.Set(tId, cancel)
 	if err := r.sendDownloadStartedEvent(tId, torrentName, destination, downloadUrl); err != nil {
 		cancel()
-		r.ctxMap.Delete(tId)
+		if r.ctxMap != nil {
+			r.ctxMap.Delete(tId)
+		}
 		return err
 	}
 
@@ -144,35 +183,74 @@ func (r *Repository) downloadTorrentItem(tId string, torrentName string, destina
 			r.ctxMap.Delete(tId)
 		}()
 
+		var failed bool
+		var failedMu sync.Mutex
 		wg := sync.WaitGroup{}
 		downloadUrls := strings.Split(downloadUrl, ",")
 		downloadMap := result.NewMap[string, downloadStatus]()
 
 		for _, url := range downloadUrls {
+			url = strings.TrimSpace(url)
 			wg.Add(1)
 			go func(ctx context.Context, url string) {
 				defer wg.Done()
 
-				// Download the file
-				ok := r.downloadFile(ctx, tId, url, destination, downloadMap)
-				if !ok {
-					return
+				if !r.downloadFileR(ctx, tId, url, destination, downloadMap) {
+					failedMu.Lock()
+					failed = true
+					failedMu.Unlock()
 				}
 			}(ctx, url)
 		}
 		wg.Wait()
 
+		failedMu.Lock()
+		hasFailed := failed
+		failedMu.Unlock()
+		if hasFailed {
+			r.logger.Warn().Str("torrentItemId", tId).Msg("debrid: Download did not complete")
+			if onDone != nil {
+				onDone(false)
+			}
+			return
+		}
+
 		r.sendDownloadCompletedEvent(tId, torrentName, destination)
 		notifier.GlobalNotifier.Notify(notifier.Debrid, fmt.Sprintf("Downloaded %q", torrentName))
+		if onDone != nil {
+			onDone(true)
+		}
 	}(ctx)
 
 	return nil
+}
+
+func (r *Repository) downloadFileR(ctx context.Context, tId string, downloadUrl string, destination string, downloadMap *result.Map[string, downloadStatus]) bool {
+	for attempt := 1; attempt <= DownloadAttempts; attempt++ {
+		if r.downloadFile(ctx, tId, downloadUrl, destination, downloadMap) {
+			return true
+		}
+		if ctx.Err() != nil || attempt == DownloadAttempts {
+			return false
+		}
+
+		r.logger.Warn().Int("attempt", attempt+1).Int("maxAttempts", DownloadAttempts).Str("downloadUrl", downloadUrl).Msg("debrid: Retrying download")
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(DownloadRetryDelay(attempt)):
+		}
+	}
+
+	return false
 }
 
 func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl string, destination string, downloadMap *result.Map[string, downloadStatus]) (ok bool) {
 	defer util.HandlePanicInModuleThen("debrid/client/downloadFile", func() {
 		ok = false
 	})
+
+	isMobile := isMobileDownload()
 
 	// Create a cancellable HTTP request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadUrl, nil)
@@ -181,12 +259,18 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 		return false
 	}
 
-	_ = os.MkdirAll(destination, os.ModePerm)
+	if isMobile {
+		if err := os.MkdirAll(destination, os.ModePerm); err != nil {
+			r.logger.Err(err).Str("destination", destination).Msg("debrid: Failed to create destination folder")
+			r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Failed to create destination folder: %v", err))
+			return false
+		}
+	} else {
+		_ = os.MkdirAll(destination, os.ModePerm)
+	}
 
-	// Download the files to a temporary folder
-	//	/path/to/destination
-	//		/.tmp-123456789
-	tmpDirPath, err := os.MkdirTemp(destination, ".tmp-")
+	// Desktop stages in the destination. Mobile stages in the app temp dir.
+	tmpDirPath, err := createDownloadTempDir(destination)
 	if err != nil {
 		r.logger.Err(err).Str("destination", destination).Msg("debrid: Failed to create temp folder")
 		r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Failed to create temp folder: %v", err))
@@ -196,7 +280,7 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 
 	if runtime.GOOS == "windows" {
 		r.logger.Debug().Str("tmpDirPath", tmpDirPath).Msg("debrid: Hiding temp folder")
-		util.HideFile(tmpDirPath)
+		_, _ = util.HideFile(tmpDirPath)
 		time.Sleep(time.Millisecond * 500)
 	}
 
@@ -209,6 +293,12 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 		return false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		r.logger.Warn().Int("statusCode", resp.StatusCode).Str("downloadUrl", downloadUrl).Msg("debrid: Download request failed")
+		r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Download failed / Unexpected status code: %d", resp.StatusCode))
+		r.sendDownloadCancelledEvent(tId, downloadUrl, downloadMap)
+		return false
+	}
 
 	// e.g. "Torrent Name.zip", "downloaded_torrent"
 	// defaults to downloaded_torrent.{ext} if we can't guess the name
@@ -256,9 +346,7 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 
 	r.logger.Debug().Str("filename", filename).Str("ext", ext).Msg("debrid: Starting download")
 
-	// Create a file in the temporary folder to store the download
-	//	/path/to/destination/.tmp-123456789/
-	//		Torrent Name.zip | downloaded_torrent.zip | Episode.mkv
+	// Create a file in the temporary folder to store the download.
 	tmpDownloadedFilePath := filepath.Join(tmpDirPath, filename)
 	file, err := os.Create(tmpDownloadedFilePath)
 	if err != nil {
@@ -335,6 +423,14 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 		}
 	}
 
+	if totalSize > 0 && totalBytes != totalSize {
+		_ = file.Close()
+		r.logger.Warn().Int64("totalBytes", totalBytes).Int64("totalSize", totalSize).Str("downloadUrl", downloadUrl).Msg("debrid: Download ended before expected size")
+		r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Download failed / Expected %s but received %s", util.Bytes(uint64(totalSize)), util.Bytes(uint64(totalBytes))))
+		r.sendDownloadCancelledEvent(tId, downloadUrl, downloadMap)
+		return false
+	}
+
 	_ = file.Close()
 
 	downloadMap.Delete(downloadUrl)
@@ -360,18 +456,15 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 	var extractedDir string
 	switch ext {
 	case ".zip":
-		//	/path/to/destination/.tmp-123456789/downlooaded_torrent.zip -> /path/to/destination/.tmp-123456789/extracted-1234/...
 		extractedDir, err = unzipFile(tmpDownloadedFilePath, tmpDirPath)
-		//	/path/to/destination/.tmp-123456789/downlooaded_torrent.rar -> /path/to/destination/.tmp-123456789/extracted-1234/...
 		r.logger.Debug().Str("extractedDir", extractedDir).Msg("debrid: Extracted zip file")
 	case ".rar":
 		extractedDir, err = unrarFile(tmpDownloadedFilePath, tmpDirPath)
 		r.logger.Debug().Str("extractedDir", extractedDir).Msg("debrid: Extracted rar file")
 	default:
-		// No extraction needed which means we downloaded a file
-		//	/path/to/destination/.tmp-123456789/Episode.mkv -> /path/to/destination/Episode.mkv
+		// No extraction needed which means we downloaded a file.
 		r.logger.Debug().Str("tmpDownloadedFilePath", tmpDownloadedFilePath).Str("destination", destination).Msg("debrid: No extraction needed, moving file directly")
-		err = moveContentsTo(filepath.Dir(tmpDownloadedFilePath), destination)
+		err = moveDownloadedContentsTo(filepath.Dir(tmpDownloadedFilePath), destination, isMobile)
 		if err != nil {
 			r.logger.Err(err).Str("tmpDownloadedFilePath", tmpDownloadedFilePath).Str("destination", destination).Msg("debrid: Failed to move downloaded file")
 			r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Failed to move downloaded file: %v", err))
@@ -389,7 +482,7 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 
 	r.logger.Debug().Msg("debrid: Extraction completed, deleting temporary files")
 
-	// Delete the downloaded file (/path/to/destination/.tmp-123456789/downlooaded_torrent.zip)
+	// Delete the archive before moving the extracted files.
 	err = os.Remove(tmpDownloadedFilePath)
 	if err != nil {
 		r.logger.Err(err).Str("tmpDownloadedFilePath", tmpDownloadedFilePath).Msg("debrid: Failed to delete downloaded file")
@@ -398,9 +491,8 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 
 	r.logger.Debug().Str("extractedDir", extractedDir).Str("destination", destination).Msg("debrid: Moving extracted files to destination")
 
-	// Move the extracted files to the destination
-	// /path/to/destination/.tmp-123456789/extracted-1234/{files} -> /path/to/destination/{files}
-	err = moveContentsTo(extractedDir, destination)
+	// Move the extracted files to the destination.
+	err = moveDownloadedContentsTo(extractedDir, destination, isMobile)
 	if err != nil {
 		r.logger.Err(err).Str("extractedDir", extractedDir).Str("destination", destination).Msg("debrid: Failed to move downloaded files")
 		r.wsEventManager.SendEvent(events.ErrorToast, fmt.Sprintf("debrid: Failed to move downloaded files: %v", err))
@@ -409,6 +501,20 @@ func (r *Repository) downloadFile(ctx context.Context, tId string, downloadUrl s
 	}
 
 	return true
+}
+
+func createDownloadTempDir(destination string) (string, error) {
+	if isMobileDownload() {
+		return os.MkdirTemp("", "seanime-debrid-")
+	}
+	return os.MkdirTemp(destination, ".tmp-")
+}
+
+func moveDownloadedContentsTo(src, dest string, isMobile bool) error {
+	if isMobile {
+		return moveContentsToMobile(src, dest)
+	}
+	return moveContentsTo(src, dest)
 }
 
 func (r *Repository) sendDownloadCancelledEvent(tId string, url string, downloadMap *result.Map[string, downloadStatus]) {

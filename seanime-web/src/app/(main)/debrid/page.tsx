@@ -10,6 +10,7 @@ import { LuffyError } from "@/components/shared/luffy-error"
 import { PageWrapper } from "@/components/shared/page-wrapper"
 import { SeaLink } from "@/components/shared/sea-link"
 import { AppLayoutStack } from "@/components/ui/app-layout"
+import { Badge } from "@/components/ui/badge"
 import { Button, IconButton } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { cn } from "@/components/ui/core/styling"
@@ -17,7 +18,7 @@ import { LoadingSpinner } from "@/components/ui/loading-spinner"
 import { Modal } from "@/components/ui/modal"
 import { Tooltip } from "@/components/ui/tooltip"
 import { WSEvents } from "@/lib/server/ws-events"
-import { formatDate } from "date-fns"
+import { formatDate, isValid } from "date-fns"
 import { atom } from "jotai"
 import { useAtom } from "jotai/react"
 import capitalize from "lodash/capitalize"
@@ -37,9 +38,17 @@ function getServiceName(provider: string) {
             return "TorBox"
         case "alldebrid":
             return "AllDebrid"
+        case "premiumize":
+            return "Premiumize"
         default:
             return provider
     }
+}
+
+function formatAddedDate(added: string) {
+    const date = new Date(added)
+    if (!added || !isValid(date)) return null
+    return formatDate(date, "yyyy-MM-dd HH:mm")
 }
 
 function getDashboardLink(provider: string) {
@@ -50,6 +59,8 @@ function getDashboardLink(provider: string) {
             return "https://real-debrid.com/torrents"
         case "alldebrid":
             return "https://alldebrid.com/magnets/"
+        case "premiumize":
+            return "https://www.premiumize.me/transfers"
         default:
             return ""
     }
@@ -85,11 +96,34 @@ function Content() {
     const [refetchInterval, setRefetchInterval] = React.useState(30000)
 
     const { data, isLoading, status, refetch } = useDebridGetTorrents(enabled, refetchInterval)
+    const [downloadProgressMap, setDownloadProgressMap] = React.useState<Record<string, DownloadProgress>>({})
+
+    useWebsocketMessageListener<DownloadProgress>({
+        type: WSEvents.DEBRID_DOWNLOAD_PROGRESS,
+        onMessage: progress => {
+            setDownloadProgressMap(prev => {
+                const next = { ...prev }
+                if (progress.status === "downloading") {
+                    next[progress.itemID] = progress
+                } else {
+                    delete next[progress.itemID]
+                }
+                return next
+            })
+
+            if (progress.status === "completed" || progress.status === "cancelled") {
+                refetch()
+            }
+        },
+        deps: [refetch],
+    })
 
     React.useEffect(() => {
-        const hasDownloads = data?.filter(t => t.status === "downloading" || t.status === "paused")?.length ?? 0
-        setRefetchInterval(hasDownloads ? 5000 : 30000)
-    }, [data])
+        const hasProviderDownloads = data?.some(t => t.status === "downloading" || t.status === "paused") ?? false
+        const hasLocalQueue = data?.some(t => t.isQueuedForLocalDownload || t.isDownloadingLocally) ?? false
+        const hasLocalDownloads = Object.keys(downloadProgressMap).length > 0
+        setRefetchInterval(hasProviderDownloads || hasLocalQueue || hasLocalDownloads ? 5000 : 30000)
+    }, [data, downloadProgressMap])
 
     React.useEffect(() => {
         if (status === "error") {
@@ -155,6 +189,7 @@ function Content() {
                             return <TorrentItem
                                 key={torrent.id}
                                 torrent={torrent}
+                                downloadProgress={downloadProgressMap[torrent.id] ?? null}
                             />
                         })}
                         {(!isLoading && !data?.length) && <LuffyError title="Nothing to see">No active torrents</LuffyError>}
@@ -174,6 +209,7 @@ const selectedTorrentItemAtom = atom<Debrid_TorrentItem | null>(null)
 type TorrentItemProps = {
     torrent: Debrid_TorrentItem
     isPending?: boolean
+    downloadProgress?: DownloadProgress | null
 }
 
 type DownloadProgress = {
@@ -181,16 +217,39 @@ type DownloadProgress = {
     itemID: string
     totalBytes: string
     totalSize: string
-    speed: string
+    speed: string | number
 }
 
-const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: TorrentItemProps) {
+function getLocalDownloadStatus(torrent: Debrid_TorrentItem, downloadProgress?: DownloadProgress | null) {
+    if (downloadProgress || torrent.isDownloadingLocally) {
+        return {
+            label: "Downloading",
+            intent: "blue" as const,
+        }
+    }
+
+    if (torrent.isQueuedForLocalDownload) {
+        return {
+            label: torrent.isReady ? "Queued" : "Waiting...",
+            intent: "warning" as const,
+        }
+    }
+
+    return null
+}
+
+
+const TorrentItem = React.memo(function TorrentItem({ torrent, isPending, downloadProgress }: TorrentItemProps) {
 
     const { mutate: deleteTorrent, isPending: isDeleting } = useDebridDeleteTorrent()
 
     const { mutate: cancelDownload, isPending: isCancelling } = useDebridCancelDownload()
 
     const [_, setSelectedTorrentItem] = useAtom(selectedTorrentItemAtom)
+
+    const localDownloadStatus = getLocalDownloadStatus(torrent, downloadProgress)
+    const isDownloadingLocally = !!downloadProgress || !!torrent.isDownloadingLocally
+    const canOpenDownloadModal = torrent.isReady && !isDownloadingLocally
 
     const confirmDeleteTorrentProps = useConfirmationDialog({
         title: "Remove torrent",
@@ -199,21 +258,6 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
             deleteTorrent({
                 torrentItem: torrent,
             })
-        },
-    })
-
-    const [progress, setProgress] = React.useState<DownloadProgress | null>(null)
-
-    useWebsocketMessageListener<DownloadProgress>({
-        type: WSEvents.DEBRID_DOWNLOAD_PROGRESS,
-        onMessage: data => {
-            if (data.itemID === torrent.id) {
-                if (data.status === "downloading") {
-                    setProgress(data)
-                } else {
-                    setProgress(null)
-                }
-            }
         },
     })
 
@@ -247,10 +291,12 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
                         <BiTime className="inline-block mx-2 mb-0.5" />
                         {torrent.eta}
                     </>}
-                    {` - `}
-                    <span className="text-[--muted]">
-                        {formatDate(torrent.added, "yyyy-MM-dd HH:mm")}
-                    </span>
+                    {!!formatAddedDate(torrent.added) && <>
+                        {` - `}
+                        <span className="text-[--muted]">
+                            {formatAddedDate(torrent.added)}
+                        </span>
+                    </>}
                     {` - `}
                     <strong
                         className={cn(
@@ -259,6 +305,15 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
                             torrent.status === "completed" && "text-green-300",
                         )}
                     >{(torrent.status === "other" || !torrent.isReady) ? "" : capitalize(torrent.status)}</strong>
+                    {localDownloadStatus && (
+                        <Badge
+                            intent={localDownloadStatus.intent}
+                            size="sm"
+                            className="ml-2 border-transparent"
+                        >
+                            {localDownloadStatus.label}
+                        </Badge>
+                    )}
                 </div>
                 {torrent.status !== "seeding" && torrent.status !== "completed" &&
                     <div data-torrent-item-progress-bar className="w-full h-1 mr-4 mt-2 relative z-[1] bg-gray-700 left-0 overflow-hidden rounded-xl">
@@ -276,7 +331,7 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
                     </div>}
             </div>
             <div className="flex-none flex gap-2 items-center">
-                {(torrent.isReady && !progress) && <IconButton
+                {canOpenDownloadModal && <IconButton
                     icon={<FiDownload />}
                     size="sm"
                     intent="gray-subtle"
@@ -286,7 +341,7 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
                         setSelectedTorrentItem(torrent)
                     }}
                 />}
-                {(!!progress && progress.itemID === torrent.id) && <div className="flex gap-2 items-center">
+                {isDownloadingLocally && <div className="flex gap-2 items-center">
                     <Tooltip
                         trigger={<p>
                             <HiFolderDownload className="text-2xl animate-pulse text-[--blue]" />
@@ -294,9 +349,13 @@ const TorrentItem = React.memo(function TorrentItem({ torrent, isPending }: Torr
                     >
                         Downloading locally
                     </Tooltip>
-                    <p>
-                        {progress?.totalBytes}<span className="text-[--muted]"> / {progress?.totalSize}</span>
-                    </p>
+                    {downloadProgress ? (
+                        <p>
+                            {downloadProgress.totalBytes}<span className="text-[--muted]"> / {downloadProgress.totalSize}</span>
+                        </p>
+                    ) : (
+                        <p className="text-sm text-[--muted]">Preparing local files</p>
+                    )}
                     <Tooltip
                         trigger={<p>
                             <IconButton

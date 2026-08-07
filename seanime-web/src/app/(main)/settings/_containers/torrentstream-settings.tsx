@@ -1,12 +1,16 @@
 import { Models_TorrentstreamSettings } from "@/api/generated/types"
+import { useGetTorrentstreamSettings } from "@/api/hooks/torrentstream.hooks"
 import { useSaveTorrentstreamSettings, useTorrentstreamDropTorrent } from "@/api/hooks/torrentstream.hooks"
+import { useWebsocketMessageListener } from "@/app/(main)/_hooks/handle-websockets.ts"
 import { AutoSelectProfileButton } from "@/app/(main)/settings/_components/autoselect-profile-form"
 import { SettingsCard } from "@/app/(main)/settings/_components/settings-card"
 import { SettingsIsDirty, SettingsSubmitButton } from "@/app/(main)/settings/_components/settings-submit-button"
+import { ExperimentalBadge } from "@/components/shared/beta-badge"
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion"
 import { Alert } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { defineSchema, Field, Form } from "@/components/ui/form"
+import { WSEvents } from "@/lib/server/ws-events.ts"
 import React from "react"
 import { UseFormReturn } from "react-hook-form"
 import { FcFolder } from "react-icons/fc"
@@ -28,6 +32,7 @@ const torrentstreamSchema = defineSchema(({ z }) => z.object({
     streamUrlAddress: z.string().optional().default(""),
     slowSeeding: z.boolean().optional().default(false),
     preloadNextStream: z.boolean().optional().default(false),
+    disableAcceleratedStartup: z.boolean().optional().default(false),
 }))
 
 
@@ -45,8 +50,16 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
     } = props
 
     const { mutate, isPending } = useSaveTorrentstreamSettings()
+    const { refetch } = useGetTorrentstreamSettings()
 
     const { mutate: dropTorrent, isPending: droppingTorrent } = useTorrentstreamDropTorrent()
+
+    useWebsocketMessageListener({
+        type: WSEvents.SETTINGS_CHANGED,
+        onMessage: () => {
+            refetch()
+        },
+    })
 
     const formRef = React.useRef<UseFormReturn<any>>(null)
 
@@ -55,6 +68,7 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
     return (
         <>
             <Form
+                key={settings?.updatedAt ?? "torrentstream-settings"}
                 schema={torrentstreamSchema}
                 mRef={formRef}
                 onSubmit={data => {
@@ -90,8 +104,9 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
                     streamUrlAddress: settings.streamUrlAddress || "",
                     slowSeeding: settings.slowSeeding,
                     preloadNextStream: settings.preloadNextStream,
+                    disableAcceleratedStartup: settings.disableAcceleratedStartup,
                 }}
-                stackClass="space-y-4"
+                stackClass="space-y-8"
             >
                 {(f) => (
                     <>
@@ -108,19 +123,10 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
                             <Field.Switch
                                 side="right"
                                 name="includeInLibrary"
-                                label="Include in anime library"
-                                help="Add non-downloaded shows that are in your currently watching list to the anime library."
+                                label="Include streaming in anime lists"
+                                help="Show currently watching streaming titles in your anime lists."
                             />
                         </SettingsCard>
-
-                        {/*<SettingsCard title="Preloading">*/}
-                        {/*    <Field.Switch*/}
-                        {/*        side="right"*/}
-                        {/*        name="preloadNextStream"*/}
-                        {/*        label="Preload next stream"*/}
-                        {/*        help="Starts downloading the next episode in the background."*/}
-                        {/*    />*/}
-                        {/*</SettingsCard>*/}
 
                         <SettingsCard title="Auto-select">
                             <Field.Switch
@@ -145,6 +151,14 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
                             <div className="pt-2">
                                 <AutoSelectProfileButton />
                             </div>
+
+                            <Field.Switch
+                                side="right"
+                                name="preloadNextStream"
+                                label={<span>Preload next episode <ExperimentalBadge title="Unstable" /></span>}
+                                help="Starts downloading the next episode in the background."
+                                moreHelp="This feature is only partially implemented. Do not rely on it working correctly."
+                            />
                         </SettingsCard>
 
 
@@ -200,7 +214,15 @@ export function TorrentstreamSettings(props: TorrentstreamSettingsProps) {
                                         side="right"
                                         name="slowSeeding"
                                         label="Slow seeding"
-                                        moreHelp="This can help avoid issues with your network."
+                                        moreHelp="This can help avoid issues with your network. Note: Slow seeding can significantly delay startup."
+                                    />
+
+                                    <Field.Switch
+                                        side="right"
+                                        name="disableAcceleratedStartup"
+                                        label="Disable accelerated startup"
+                                        disabled={f.watch("slowSeeding")}
+                                        moreHelp="Turn this on to disable aggressive peer discovery and connection limits during startup."
                                     />
                                 </AccordionContent>
                             </AccordionItem>

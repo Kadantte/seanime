@@ -2,12 +2,11 @@ package videocore
 
 import (
 	"encoding/json"
-	"testing"
-	"time"
-
 	"seanime/internal/events"
 	"seanime/internal/library/anime"
 	"seanime/internal/util"
+	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -21,6 +20,7 @@ type recordedWSEvent struct {
 type recordingWSEventManager struct {
 	videoCoreSubscriber *events.ClientEventSubscriber
 	sent                []recordedWSEvent
+	clientIds           []string
 }
 
 func newRecordingWSEventManager() *recordingWSEventManager {
@@ -35,6 +35,10 @@ func (m *recordingWSEventManager) SendEventTo(clientId string, eventType string,
 	m.sent = append(m.sent, recordedWSEvent{clientId: clientId, eventType: eventType, payload: payload})
 }
 
+func (m *recordingWSEventManager) GetClientIds() []string { return m.clientIds }
+
+func (m *recordingWSEventManager) GetClientPlatform(string) string { return "" }
+
 func (m *recordingWSEventManager) SubscribeToClientEvents(string) *events.ClientEventSubscriber {
 	return &events.ClientEventSubscriber{Channel: make(chan *events.WebsocketClientEvent, 1)}
 }
@@ -45,6 +49,10 @@ func (m *recordingWSEventManager) SubscribeToClientNativePlayerEvents(string) *e
 
 func (m *recordingWSEventManager) SubscribeToClientVideoCoreEvents(string) *events.ClientEventSubscriber {
 	return m.videoCoreSubscriber
+}
+
+func (m *recordingWSEventManager) SubscribeToClientMpvCoreEvents(string) *events.ClientEventSubscriber {
+	return &events.ClientEventSubscriber{Channel: make(chan *events.WebsocketClientEvent, 1)}
 }
 
 func (m *recordingWSEventManager) SubscribeToClientNakamaEvents(string) *events.ClientEventSubscriber {
@@ -294,6 +302,82 @@ func TestGetSkipDataAllowsEmptyClientState(t *testing.T) {
 	}
 }
 
+func TestPlayerStateRequestsTimeout(t *testing.T) {
+	previousTimeout := playerEventResponseTimeout
+	playerEventResponseTimeout = 10 * time.Millisecond
+	t.Cleanup(func() {
+		playerEventResponseTimeout = previousTimeout
+	})
+
+	logger := util.NewLogger()
+	ws := newRecordingWSEventManager()
+	vc := New(NewVideoCoreOptions{
+		WsEventManager: ws,
+		Logger:         logger,
+	})
+
+	t.Cleanup(vc.Shutdown)
+
+	vc.setPlaybackState(newPlaybackState("playback-1"))
+
+	tests := []struct {
+		name      string
+		eventType ServerEvent
+		call      func() bool
+	}{
+		{
+			name:      "text tracks",
+			eventType: ServerEventGetTextTracks,
+			call: func() bool {
+				_, ok := vc.GetTextTracks()
+				return ok
+			},
+		},
+		{
+			name:      "playlist",
+			eventType: ServerEventGetPlaylist,
+			call: func() bool {
+				_, ok := vc.GetPlaylist()
+				return ok
+			},
+		},
+		{
+			name:      "status",
+			eventType: ServerEventGetStatus,
+			call: func() bool {
+				_, ok := vc.PullStatus()
+				return ok
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ws.sent = nil
+			resultCh := make(chan bool, 1)
+
+			go func() {
+				resultCh <- tt.call()
+			}()
+
+			require.Eventually(t, func() bool {
+				return len(ws.sent) == 1
+			}, time.Second, 10*time.Millisecond)
+
+			// missing client responses should release
+			envelope := decodeVideoCoreEnvelope(t, ws.sent[0].payload)
+			require.Equal(t, string(tt.eventType), envelope["type"])
+
+			select {
+			case ok := <-resultCh:
+				require.False(t, ok)
+			case <-time.After(time.Second):
+				t.Fatal("expected player state request to time out")
+			}
+		})
+	}
+}
+
 func TestVideoStatusRecoversAfterZeroDurationLoadedMetadata(t *testing.T) {
 	logger := util.NewLogger()
 	ws := newRecordingWSEventManager()
@@ -367,4 +451,100 @@ func TestVideoStatusRecoversAfterZeroDurationLoadedMetadata(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("expected recovered video status event")
 	}
+}
+
+func TestConnectedPlaybackOwnerBlocksAnotherClient(t *testing.T) {
+	logger := util.NewLogger()
+	ws := newRecordingWSEventManager()
+	ws.clientIds = []string{"owner-client", "new-client"}
+	vc := New(NewVideoCoreOptions{WsEventManager: ws, Logger: logger})
+	t.Cleanup(vc.Shutdown)
+
+	ownerState := newPlaybackState("owner-playback")
+	ownerState.ClientId = "owner-client"
+	vc.setPlaybackState(ownerState)
+
+	newState := newPlaybackState("new-playback")
+	newState.ClientId = "new-client"
+	ws.MockSendVideoCoreEvent(ClientEvent{
+		ClientId: "new-client",
+		Type:     PlayerEventVideoLoaded,
+		Payload:  mustMarshalRaw(t, clientVideoLoadedPayload{State: *newState}),
+	})
+
+	require.Never(t, func() bool {
+		state, ok := vc.GetPlaybackState()
+		return ok && state.ClientId == "new-client"
+	}, 100*time.Millisecond, 10*time.Millisecond)
+}
+
+func TestVideoLoadedTakesOverFromDisconnectedOwner(t *testing.T) {
+	logger := util.NewLogger()
+	ws := newRecordingWSEventManager()
+	ws.clientIds = []string{"new-client"}
+	vc := New(NewVideoCoreOptions{WsEventManager: ws, Logger: logger})
+	t.Cleanup(vc.Shutdown)
+
+	ownerState := newPlaybackState("owner-playback")
+	ownerState.ClientId = "owner-client"
+	vc.setPlaybackState(ownerState)
+	vc.setPlaybackStatus(&PlaybackStatus{
+		Id:          "owner-playback",
+		ClientId:    "owner-client",
+		CurrentTime: 20,
+		Duration:    100,
+	})
+
+	newState := newPlaybackState("new-playback")
+	newState.ClientId = "new-client"
+	ws.MockSendVideoCoreEvent(ClientEvent{
+		ClientId: "new-client",
+		Type:     PlayerEventVideoLoaded,
+		Payload:  mustMarshalRaw(t, clientVideoLoadedPayload{State: *newState}),
+	})
+
+	require.Eventually(t, func() bool {
+		state, ok := vc.GetPlaybackState()
+		return ok && state.ClientId == "new-client" && state.PlaybackInfo.Id == "new-playback"
+	}, time.Second, 10*time.Millisecond)
+
+	vc.playbackStatusMu.RLock()
+	defer vc.playbackStatusMu.RUnlock()
+	require.Nil(t, vc.playbackStatus)
+}
+
+func TestNonLoadEventCannotClaimDisconnectedPlayback(t *testing.T) {
+	logger := util.NewLogger()
+	ws := newRecordingWSEventManager()
+	ws.clientIds = []string{"new-client"}
+	vc := New(NewVideoCoreOptions{WsEventManager: ws, Logger: logger})
+	t.Cleanup(vc.Shutdown)
+
+	ownerState := newPlaybackState("owner-playback")
+	ownerState.ClientId = "owner-client"
+	vc.setPlaybackState(ownerState)
+	vc.setPlaybackStatus(&PlaybackStatus{
+		Id:          "owner-playback",
+		ClientId:    "owner-client",
+		CurrentTime: 20,
+		Duration:    100,
+	})
+
+	ws.MockSendVideoCoreEvent(ClientEvent{
+		ClientId: "new-client",
+		Type:     PlayerEventVideoStatus,
+		Payload: mustMarshalRaw(t, clientVideoStatusPayload{
+			CurrentTime: 80,
+			Duration:    100,
+		}),
+	})
+
+	require.Never(t, func() bool {
+		status, ok := vc.GetPlaybackStatus()
+		return ok && status.CurrentTime == 80
+	}, 100*time.Millisecond, 10*time.Millisecond)
+
+	state, ok := vc.GetPlaybackState()
+	require.True(t, ok)
+	require.Equal(t, "owner-client", state.ClientId)
 }

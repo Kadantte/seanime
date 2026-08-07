@@ -69,6 +69,13 @@ func (p *GojaPlugin) GetExtension() *extension.Extension {
 	return p.ext
 }
 
+func (p *GojaPlugin) ListAnimeEntryEpisodeTabs() []*plugin_ui.EpisodeTabItem {
+	if p.ui == nil {
+		return nil
+	}
+	return p.ui.ListAnimeEntryEpisodeTabs()
+}
+
 func (p *GojaPlugin) PutVM(vm *goja.Runtime) {
 	p.pool.Put(vm)
 }
@@ -266,7 +273,10 @@ func (p *GojaPlugin) BindPluginAPIs(vm *goja.Runtime, logger *zerolog.Logger) {
 				p.storage = plugin.GlobalAppContext.BindStorage(vm, logger, p.ext, p.scheduler)
 
 			case extension.PluginPermissionAnilist: // Anilist
-				plugin.GlobalAppContext.BindAnilist(vm, logger, p.ext)
+				plugin.GlobalAppContext.BindAnilist(vm, logger, p.ext, p.scheduler)
+
+			case extension.PluginPermissionCustomClient: // Custom client
+				plugin.GlobalAppContext.BindAnilistCustomClient(vm, logger, p.ext, p.scheduler)
 
 			case extension.PluginPermissionDatabase: // Database
 				plugin.GlobalAppContext.BindDatabase(vm, logger, p.ext)

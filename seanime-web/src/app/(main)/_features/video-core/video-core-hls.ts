@@ -1,4 +1,5 @@
 import { vc_audioManager } from "@/app/(main)/_features/video-core/video-core"
+import { getPreferredHlsQualityLevel } from "@/app/(main)/_features/video-core/_lib/hls-quality"
 import { vc_autoPlayVideoAtom } from "@/app/(main)/_features/video-core/video-core.atoms"
 import { logger } from "@/lib/helpers/debug"
 import Hls, { ErrorData, Events, Level } from "hls.js"
@@ -32,6 +33,7 @@ export const vc_hlsSetAudioTrack = atom<((trackId: number) => void) | null>(null
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 const hlsLog = logger("VIDEO CORE HLS")
+const MAX_MEDIA_ERROR_RECOVERY_ATTEMPTS = 2
 
 
 export const HLS_VIDEO_EXTENSIONS = /\.(m3u8)($|\?)/i
@@ -50,16 +52,25 @@ export function useVideoCoreHls({
     videoElement,
     streamUrl,
     streamType,
+    preferredQuality,
     onFatalError,
+    onStalled,
     onMediaDetached,
 }: {
     videoElement: HTMLVideoElement | null
     streamUrl: string | undefined
     streamType?: string
+    preferredQuality?: string
     onMediaDetached?: () => void
     onFatalError?: (error: ErrorData) => void
+    onStalled?: (error: ErrorData) => void
 }) {
     const hlsRef = useRef<Hls | null>(null)
+    const preferredQualityRef = useRef(preferredQuality)
+
+    useEffect(() => {
+        preferredQualityRef.current = preferredQuality
+    }, [preferredQuality])
 
     const audioManager = useAtomValue(vc_audioManager)
     const autoPlay = useAtomValue(vc_autoPlayVideoAtom)
@@ -108,8 +119,50 @@ export function useVideoCoreHls({
                 enableWebVTT: true,
                 renderTextTracksNatively: false, // don't use native text tracks for subtitles
             })
+            let sourceLoaded = false
+            let recoveringMediaError = false
+            let mediaErrorRecoveryAttempts = 0
+            let fatalErrorReported = false
 
             hlsRef.current = hls
+
+            const reportFatalError = (data: ErrorData) => {
+                if (fatalErrorReported) return
+                fatalErrorReported = true
+
+                hlsLog.error("Unrecoverable HLS error", data)
+                if (hlsRef.current === hls) {
+                    hlsRef.current = null
+                }
+                hls.destroy()
+                onFatalError?.(data)
+            }
+
+            const recoverFatalMediaError = () => {
+                if (mediaErrorRecoveryAttempts >= MAX_MEDIA_ERROR_RECOVERY_ATTEMPTS) {
+                    return false
+                }
+
+                recoveringMediaError = true
+                mediaErrorRecoveryAttempts += 1
+
+                try {
+                    if (mediaErrorRecoveryAttempts === MAX_MEDIA_ERROR_RECOVERY_ATTEMPTS) {
+                        hlsLog.warning("Fatal media error, swapping audio codec and retrying")
+                        hls.swapAudioCodec()
+                    } else {
+                        hlsLog.warning("Fatal media error, attempting recovery")
+                    }
+
+                    hls.recoverMediaError()
+                    return true
+                }
+                catch (error) {
+                    recoveringMediaError = false
+                    hlsLog.error("Failed to recover from fatal media error", error)
+                    return false
+                }
+            }
 
             // Quality setter function
             const qualitySetter = (levelIndex: number) => {
@@ -134,12 +187,18 @@ export function useVideoCoreHls({
 
             hls.on(Events.MEDIA_ATTACHED, () => {
                 hlsLog.info("HLS media attached")
-                hls.loadSource(streamUrl)
+                if (!sourceLoaded) {
+                    sourceLoaded = true
+                    hls.loadSource(streamUrl)
+                }
+                recoveringMediaError = false
             })
 
             hls.on(Events.MEDIA_DETACHED, () => {
                 hlsLog.info("HLS media detached")
-                onMediaDetached?.()
+                if (!recoveringMediaError) {
+                    onMediaDetached?.()
+                }
             })
 
             hls.on(Events.MANIFEST_PARSED, (event, data) => {
@@ -155,6 +214,11 @@ export function useVideoCoreHls({
                 }))
 
                 setQualityLevels(levels)
+                const preferredLevel = getPreferredHlsQualityLevel(levels, preferredQualityRef.current)
+                if (preferredLevel !== null) {
+                    hlsLog.info("Applying preferred quality level", preferredLevel)
+                    hls.currentLevel = preferredLevel
+                }
                 setCurrentQuality(hls.currentLevel)
 
                 // Extract audio tracks
@@ -165,7 +229,7 @@ export function useVideoCoreHls({
                     const uniqueTracks = new Map<string, { track: any, index: number }>()
 
                     data.audioTracks.forEach((track: any, index: number) => {
-                        const key = `${track.groupId || ""}-${track.lang || "unknown"}-${track.name || ""}-${track.audioCodec || ""}`
+                        const key = `${track.id ?? index}-${track.groupId || ""}-${track.lang || "unknown"}-${track.name || ""}-${track.audioCodec || ""}`
 
                         // Keep the first occurrence of each unique track
                         if (!uniqueTracks.has(key)) {
@@ -174,7 +238,7 @@ export function useVideoCoreHls({
                     })
 
                     const audioTracks: HlsAudioTrack[] = Array.from(uniqueTracks.values()).map(({ track, index }) => ({
-                        id: index,
+                        id: typeof track.id === "number" ? track.id : index,
                         name: track.name || track.lang || `Track ${track.id}`,
                         language: track.lang,
                         default: track.default,
@@ -205,25 +269,26 @@ export function useVideoCoreHls({
                 setCurrentAudioTrack(hls.audioTrack)
             })
 
+            hls.on(Events.FRAG_CHANGED, () => {
+                if (mediaErrorRecoveryAttempts > 0) {
+                    hlsLog.success("HLS media error recovery succeeded")
+                    mediaErrorRecoveryAttempts = 0
+                }
+            })
+
             hls.on(Events.ERROR, (event, data: ErrorData) => {
                 hlsLog.error("HLS error", data)
-                if (data.fatal) {
-                    hlsLog.error("Fatal error, cannot recover")
-                    hls.destroy()
-                    onFatalError?.(data)
-                    // switch (data.type) {
-                    //     case Hls.ErrorTypes.NETWORK_ERROR:
-                    //         hlsLog.error("Fatal network error, trying to recover")
-                    //         hls.startLoad()
-                    //         break
-                    //     case Hls.ErrorTypes.MEDIA_ERROR:
-                    //         hlsLog.error("Fatal media error, trying to recover")
-                    //         hls.recoverMediaError()
-                    //         break
-                    //     default:
-                    //         break
-                    // }
+                if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR && !data.fatal) {
+                    onStalled?.(data)
                 }
+
+                if (!data.fatal) return
+
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && recoverFatalMediaError()) {
+                    return
+                }
+
+                reportFatalError(data)
             })
 
             return () => {
@@ -295,4 +360,3 @@ export async function isProbablyHls(url: string): Promise<"hls" | "unknown"> {
         return "unknown"
     }
 }
-

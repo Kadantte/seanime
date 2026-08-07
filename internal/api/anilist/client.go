@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"seanime/internal/constants"
+	"net/url"
 	"seanime/internal/events"
 	"seanime/internal/util"
 	"strconv"
@@ -75,12 +75,10 @@ func NewAnilistClient(token string, cacheDir string) *AnilistClientImpl {
 		token:    token,
 		cacheDir: cacheDir,
 		Client: &Client{
-			Client: clientv2.NewClient(http.DefaultClient, constants.AnilistApiUrl, nil,
+			Client: clientv2.NewClient(alHttpClient(), alApiUrl(), nil,
 				func(ctx context.Context, req *http.Request, gqlInfo *clientv2.GQLRequestInfo, res interface{}, next clientv2.RequestInterceptorFunc) error {
-					req.Header.Set("Content-Type", "application/json")
-					req.Header.Set("Accept", "application/json")
-					if len(token) > 0 {
-						req.Header.Set("Authorization", "Bearer "+token)
+					if err := initAnilistReq(ctx, req, token); err != nil {
+						return err
 					}
 					return next(ctx, req, gqlInfo, res)
 				}),
@@ -97,11 +95,11 @@ func (ac *AnilistClientImpl) IsAuthenticated() bool {
 	if ac.Client == nil || ac.Client.Client == nil {
 		return false
 	}
-	if len(ac.token) == 0 {
+	provider := currentRequestProvider()
+	if provider == nil {
 		return false
 	}
-	// If the token is not empty, we are authenticated
-	return true
+	return provider.IsAuthenticated(ac.token)
 }
 
 func (ac *AnilistClientImpl) GetCacheDir() string {
@@ -110,6 +108,37 @@ func (ac *AnilistClientImpl) GetCacheDir() string {
 
 func (ac *AnilistClientImpl) CustomQuery(body []byte, logger *zerolog.Logger, token ...string) (data interface{}, err error) {
 	return customQuery(body, logger, token...)
+}
+
+func alApiUrl() string {
+	return currentRequestProvider().ApiUrl()
+}
+
+func alHttpClient() *http.Client {
+	return requestProviderHTTPClient(currentRequestProvider())
+}
+
+func initAnilistReq(ctx context.Context, req *http.Request, token string) error {
+	provider := currentRequestProvider()
+	if err := setAnilistReqUrl(req, provider.ApiUrl()); err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	return provider.PrepareRequest(ctx, req, token)
+}
+
+func setAnilistReqUrl(req *http.Request, rawURL string) error {
+	apiURL, err := url.Parse(rawURL)
+	if err != nil {
+		return err
+	}
+
+	req.URL = apiURL
+	req.Host = apiURL.Host
+	return nil
 }
 
 ////////////////////////////////
@@ -374,7 +403,7 @@ func parseResponseDate(headers http.Header) (time.Time, bool) {
 	return parsed, true
 }
 
-func parseAniListRateLimitResetTime(headers http.Header, now time.Time) (time.Time, bool) {
+func parseRateLimitResetTime(headers http.Header, now time.Time) (time.Time, bool) {
 	if resetAt, ok := parseRetryAfterTime(headers, now); ok {
 		return resetAt, true
 	}
@@ -414,6 +443,20 @@ func parseRetryAfterTime(headers http.Header, now time.Time) (time.Time, bool) {
 	return parsed, true
 }
 
+func getRetryWindow(resp *http.Response, remaining string) (time.Time, time.Time, bool) {
+	if resp.StatusCode != http.StatusTooManyRequests && remaining != "0" {
+		return time.Time{}, time.Time{}, false
+	}
+
+	responseTime := time.Now()
+	if parsed, ok := parseResponseDate(resp.Header); ok {
+		responseTime = parsed
+	}
+
+	resetAt, ok := parseRateLimitResetTime(resp.Header, responseTime)
+	return responseTime, resetAt, ok
+}
+
 var (
 	sentRateLimitWarningTime                    = time.Now().Add(-10 * time.Second)
 	sharedAniListRateBlocker requestRateBlocker = newAniListRateBlocker()
@@ -433,9 +476,9 @@ func doAniListRequestWithRetries(
 		sleep = sleepWithContext
 	}
 
-	const retryCount = 2
+	const maxRetries = 3
 
-	for i := 0; i < retryCount; i++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if err := req.Context().Err(); err != nil {
 			return nil, rlRemainingStr, err
 		}
@@ -446,7 +489,7 @@ func doAniListRequestWithRetries(
 			}
 		}
 
-		if i > 0 && req.Body != nil {
+		if attempt > 0 && req.Body != nil {
 			if req.GetBody == nil {
 				return nil, rlRemainingStr, errors.New("failed to retry request: request body is not replayable")
 			}
@@ -464,28 +507,24 @@ func doAniListRequestWithRetries(
 		}
 
 		rlRemainingStr = resp.Header.Get("X-Ratelimit-Remaining")
-		responseTime := time.Now()
-		if responseDate, ok := parseResponseDate(resp.Header); ok {
-			responseTime = responseDate
-		}
-		if resetAt, ok := parseAniListRateLimitResetTime(resp.Header, responseTime); ok {
-			if rateBlocker == nil || rateBlocker.BlockUntil(resetAt) {
-				if onRateLimited != nil {
-					waitSeconds := int(resetAt.Sub(responseTime).Round(time.Second) / time.Second)
-					if waitSeconds < 1 {
-						waitSeconds = 1
-					}
-					onRateLimited(waitSeconds)
-				}
-			}
-			closeAniListResponseBody(resp)
-			continue
+		responseTime, resetAt, shouldRetry := getRetryWindow(resp, rlRemainingStr)
+		if !shouldRetry {
+			return resp, rlRemainingStr, nil
 		}
 
-		return resp, rlRemainingStr, nil
+		if rateBlocker == nil || rateBlocker.BlockUntil(resetAt) {
+			if onRateLimited != nil {
+				waitSeconds := int(resetAt.Sub(responseTime).Round(time.Second) / time.Second)
+				if waitSeconds < 1 {
+					waitSeconds = 1
+				}
+				onRateLimited(waitSeconds)
+			}
+		}
+		closeAniListResponseBody(resp)
 	}
 
-	return resp, rlRemainingStr, nil
+	return nil, rlRemainingStr, errors.New("anilist: rate limit exceeded, retries exhausted")
 }
 
 func closeAniListResponseBody(resp *http.Response) {
@@ -512,6 +551,10 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 func notifyAniListRateLimit(logger *zerolog.Logger, waitSeconds int) {
 	if logger != nil {
 		logger.Warn().Msgf("anilist: Rate limited, retrying in %d seconds", waitSeconds)
+	}
+
+	if events.GlobalWSEventManager != nil {
+		events.GlobalWSEventManager.SendEvent(events.AnilistRateLimit, waitSeconds)
 	}
 
 	if time.Since(sentRateLimitWarningTime) <= 10*time.Second {
@@ -547,7 +590,7 @@ func (ac *AnilistClientImpl) customDoFunc(ctx context.Context, req *http.Request
 
 	var resp *http.Response
 	resp, rlRemainingStr, err = doAniListRequestWithRetries(
-		http.DefaultClient,
+		alHttpClient(),
 		req,
 		sharedAniListRateBlocker,
 		sleepWithContext,
@@ -618,7 +661,7 @@ func unmarshal(data []byte, res interface{}) error {
 	}
 
 	var err error
-	if resp.Errors != nil && len(resp.Errors) > 0 {
+	if len(resp.Errors) > 0 {
 		// try to parse standard graphql error
 		err = &clientv2.GqlErrorList{}
 		if e := json.Unmarshal(data, err); e != nil {

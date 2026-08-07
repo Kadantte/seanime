@@ -1,5 +1,6 @@
 import { SeaCommandActions } from "@/app/(main)/_features/sea-command/sea-command-actions"
 import { SeaCommandSearch } from "@/app/(main)/_features/sea-command/sea-command-search"
+import { SeaCommandSpoilers } from "@/app/(main)/_features/sea-command/sea-command-spoilers"
 import {
     __seaCommand_torrentMagnetEpisodeNumberAtom,
     __seaCommand_torrentMagnetLinkAtom,
@@ -245,8 +246,15 @@ export function SeaCommand() {
                         shouldShow={ctx => (
                             ctx.command.command === "logs"
                             || ctx.command.command === "issue"
+                            || ctx.command.command === "droptorrent"
+                            || ctx.command.command === "reload"
+                            || ctx.command.command === "devtool"
                         )}
                         render={() => <SeaCommandActions />}
+                    />
+                    <SeaCommandHandler
+                        shouldShow={ctx => ctx.command.command === "spoilers"}
+                        render={() => <SeaCommandSpoilers />}
                     />
 
                     {/*Injected items*/}

@@ -82,14 +82,11 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 		return func(c echo.Context) error {
 			req := c.Request()
 			cookie, err := c.Cookie(clientIdCookieName)
-			clientID := ""
+			cookieClientID := ""
 			if err == nil {
-				clientID = strings.TrimSpace(cookie.Value)
+				cookieClientID = strings.TrimSpace(cookie.Value)
 			}
-
-			if clientID == "" {
-				clientID = getClientIdFromRequest(app, req)
-			}
+			clientID := resolveClientIdFromRequest(app, req, cookieClientID)
 
 			if clientID == "" {
 				clientID = uuid.New().String()
@@ -119,8 +116,6 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	})
 
 	e.Use(headMethodMiddleware)
-	e.Use(h.controlPlaneBodyLimitMiddleware)
-	e.Use(h.controlPlaneMutationRateLimitMiddleware)
 
 	e.GET("/events", h.webSocketEventHandler)
 
@@ -164,6 +159,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	// Settings
 	v1.GET("/settings", h.HandleGetSettings)
 	v1.PATCH("/settings", h.HandleSaveSettings)
+	v1.PATCH("/settings/path", h.HandlePatchSetting)
 	v1.POST("/start", h.HandleGettingStarted)
 	v1.PATCH("/settings/auto-downloader", h.HandleSaveAutoDownloaderSettings)
 	v1.PATCH("/settings/media-player", h.HandleSaveMediaPlayerSettings)
@@ -297,6 +293,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1.POST("/torrent/search", h.HandleSearchTorrent)
 	v1.POST("/torrent-client/download", h.HandleTorrentClientDownload)
 	v1.GET("/torrent-client/list", h.HandleGetActiveTorrentList)
+	v1.GET("/torrent-client/details", h.HandleGetBuiltInTorrentDetails)
 	v1.POST("/torrent-client/action", h.HandleTorrentClientAction)
 	v1.POST("/torrent-client/get-files", h.HandleTorrentClientGetFiles)
 	v1.POST("/torrent-client/rule-magnet", h.HandleTorrentClientAddMagnetFromRule)
@@ -394,6 +391,12 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1Manga.GET("/anilist/collection/raw/tags", h.HandleGetRawAnilistMangaCollectionTags)
 	v1Manga.POST("/anilist/list", h.HandleAnilistListManga)
 	v1Manga.GET("/collection", h.HandleGetMangaCollection)
+	v1Manga.GET("/preferences", h.HandleGetMangaPreferences)
+	v1Manga.POST("/preferences/import", h.HandleImportMangaPreferences)
+	v1Manga.PATCH("/preferences/:mediaId", h.HandlePatchMangaPreference)
+	v1Manga.POST("/source-refresh", h.HandleStartMangaSourceRefresh)
+	v1Manga.GET("/source-refresh", h.HandleGetMangaSourceRefresh)
+	v1Manga.DELETE("/source-refresh", h.HandleStopMangaSourceRefresh)
 	v1Manga.GET("/latest-chapter-numbers", h.HandleGetMangaLatestChapterNumbersMap)
 	v1Manga.POST("/refetch-chapter-containers", h.HandleRefetchMangaChapterContainers)
 	v1Manga.GET("/entry/:id", h.HandleGetMangaEntry)
@@ -415,6 +418,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1Manga.POST("/download-queue/reset-errored", h.HandleResetErroredChapterDownloadQueue)
 
 	v1Manga.POST("/search", h.HandleMangaManualSearch)
+	v1Manga.POST("/manual-mapping/preview", h.HandlePreviewMangaMapping)
 	v1Manga.POST("/manual-mapping", h.HandleMangaManualMapping)
 	v1Manga.POST("/get-mapping", h.HandleGetMangaMapping)
 	v1Manga.POST("/remove-mapping", h.HandleRemoveMangaMapping)
@@ -457,6 +461,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1.GET("/mediastream/direct", h.HandleMediastreamDirectPlay)
 	v1.HEAD("/mediastream/direct", h.HandleMediastreamDirectPlay)
 	v1.GET("/mediastream/file", h.HandleMediastreamFile)
+	v1.GET("/mediastream/local-subtitles", h.HandleMediastreamLocalSubtitles)
 
 	//
 	// Direct Stream
@@ -471,6 +476,8 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	// VideoCore
 	//
 	v1.GET("/videocore/insight/character/:malId", h.HandleVideoCoreInSightGetCharacterDetails)
+	v1.POST("/videocore/screenshot", h.HandleVideoCoreSaveScreenshot)
+	v1.GET("/mpvcore/insight/character/:malId", h.HandleMpvCoreInSightGetCharacterDetails)
 
 	//
 	// Torrent stream
@@ -482,6 +489,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1.POST("/torrentstream/drop", h.HandleTorrentstreamDropTorrent)
 	v1.POST("/torrentstream/torrent-file-previews", h.HandleGetTorrentstreamTorrentFilePreviews)
 	v1.POST("/torrentstream/batch-history", h.HandleGetTorrentstreamBatchHistory)
+	v1.POST("/torrentstream/batch-history/delete", h.HandleDeleteTorrentstreamBatchHistory)
 	v1.GET("/torrentstream/stream/*", h.HandleTorrentstreamServeStream)
 
 	//
@@ -497,6 +505,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1Extensions.POST("/external/edit-payload", h.HandleUpdateExtensionCode)
 	v1Extensions.POST("/external/reload", h.HandleReloadExternalExtensions)
 	v1Extensions.POST("/external/reload", h.HandleReloadExternalExtension)
+	v1Extensions.POST("/external/disabled", h.HandleSetExternalExtensionDisabled)
 	v1Extensions.POST("/all", h.HandleGetAllExtensions)
 	v1Extensions.GET("/updates", h.HandleGetExtensionUpdateData)
 	v1Extensions.GET("/list", h.HandleListExtensionData)
@@ -505,6 +514,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1Extensions.GET("/list/manga-provider", h.HandleListMangaProviderExtensions)
 	v1Extensions.GET("/list/onlinestream-provider", h.HandleListOnlinestreamProviderExtensions)
 	v1Extensions.GET("/list/anime-torrent-provider", h.HandleListAnimeTorrentProviderExtensions)
+	v1Extensions.GET("/list/anime-entry-episode-tabs", h.HandleListAnimeEntryEpisodeTabExtensions)
 	v1Extensions.GET("/list/custom-source", h.HandleListCustomSourceExtensions)
 	v1Extensions.GET("/user-config/:id", h.HandleGetExtensionUserConfig)
 	v1Extensions.POST("/user-config", h.HandleSaveExtensionUserConfig)
@@ -545,6 +555,8 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 
 	v1.GET("/debrid/settings", h.HandleGetDebridSettings)
 	v1.PATCH("/debrid/settings", h.HandleSaveDebridSettings)
+	v1.GET("/debrid/dummy/settings", h.HandleGetDummyDebridSettings)
+	v1.PATCH("/debrid/dummy/settings", h.HandleSaveDummyDebridSettings)
 	v1.POST("/debrid/torrents", h.HandleDebridAddTorrents)
 	v1.POST("/debrid/torrents/download", h.HandleDebridDownloadTorrent)
 	v1.POST("/debrid/torrents/cancel", h.HandleDebridCancelDownload)

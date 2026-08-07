@@ -118,6 +118,26 @@ declare namespace $ui {
         debridstream: DebridStream
 
         /**
+         * Cron
+         */
+        cron: Cron
+
+        /**
+         * Auth actions. Requires the auth permission and user approval.
+         */
+        auth: Auth
+
+        /**
+         * App settings. Requires the settings permission and user approval.
+         */
+        appSettings: AppSettings
+
+        /**
+         * Extension management. Requires the extensions permission and user approval.
+         */
+        extensions: Extensions
+
+        /**
          * Creates a new state object with an initial value.
          * @param initialValue - The initial value for the state
          * @returns A state object that can be used to get and set values
@@ -285,6 +305,32 @@ declare namespace $ui {
         define<T extends Record<string, any>>(name: string, defaults: T): DefinedSettings<T>
     }
 
+    interface Auth {
+        login(token: string): Promise<boolean>
+
+        logout(): Promise<boolean>
+    }
+
+    interface AppSettings {
+        get<T = Record<string, any>>(): Promise<T>
+
+        get<T = any>(path: string, fallback?: T): Promise<T>
+
+        set<T extends Record<string, any> = Record<string, any>>(settings: T): Promise<T>
+
+        set<T = any>(path: string, value: T): Promise<Record<string, any>>
+
+        patch<T extends Record<string, any> = Record<string, any>>(settings: T): Promise<Record<string, any>>
+    }
+
+    interface Extensions {
+        enable(id: string): Promise<boolean>
+
+        disable(id: string): Promise<boolean>
+
+        setDisabled(id: string, disabled: boolean): Promise<boolean>
+    }
+
     interface PollOptions {
         immediate?: boolean
     }
@@ -327,6 +373,8 @@ declare namespace $ui {
         body?: any
         /** Whether to bypass cloudflare */
         noCloudflareBypass?: boolean
+        /** Redirect behavior, defaults to follow */
+        redirect?: "follow" | "manual" | "error"
         /** Timeout in seconds, defaults to 35 */
         timeout?: number
         /** AbortSignal to cancel the request */
@@ -467,7 +515,7 @@ declare namespace $ui {
         close(): void
 
         /** Updates the badge number of the tray icon. 0 = no badge. Default intent is "info". */
-        updateBadge(options: { number: number, intent?: "success" | "error" | "warning" | "info" }): void
+        updateBadge(options: { number: number, intent?: "success" | "error" | "warning" | "info" | "alert" }): void
     }
 
     interface WebviewOptions {
@@ -936,6 +984,18 @@ declare namespace $ui {
         newMangaPageButton(props: { label: string, intent?: Intent, style?: Record<string, string>, tooltipText?: string }): MangaPageButtonAction
 
         /**
+         * Creates a new dropdown menu item for the manga page
+         * @param props - Dropdown item properties
+         */
+        newMangaPageDropdownItem(props: { label: string, style?: Record<string, string> }): ActionObject<{ media: $app.AL_BaseManga }>
+
+        /**
+         * Creates a new dropdown menu item for the manga library
+         * @param props - Dropdown item properties
+         */
+        newMangaLibraryDropdownItem(props: { label: string, style?: Record<string, string> }): ActionObject
+
+        /**
          * Creates a new context menu item for the episode card
          * @param props - Context menu item properties
          */
@@ -1064,6 +1124,49 @@ declare namespace $ui {
         render?: () => void
         /** Called when the item is selected */
         onSelect: () => void
+    }
+
+    interface Cron {
+        /**
+         * Adds a cron job
+         * @param id - The id of the cron job
+         * @param cronExpr - The cron expression
+         * @param fn - The function to call
+         */
+        add(id: string, cronExpr: string, fn: () => void): void
+
+        /**
+         * Removes a cron job
+         * @param id - The id of the cron job
+         */
+        remove(id: string): void
+
+        /**
+         * Removes all cron jobs
+         */
+        removeAll(): void
+
+        /**
+         * Gets the total number of cron jobs
+         * @returns The total number of cron jobs
+         */
+        total(): number
+
+        /**
+         * Starts the cron jobs, can be paused by calling stop()
+         */
+        start(): void
+
+        /**
+         * Stops the cron jobs, can be resumed by calling start()
+         */
+        stop(): void
+
+        /**
+         * Checks if the cron jobs have started
+         * @returns True if the cron jobs have started, false otherwise
+         */
+        hasStarted(): boolean
     }
 
     interface Screen {
@@ -1833,6 +1936,12 @@ declare namespace $ui {
         setLegacyAnimeActivity(activity: $app.DiscordRPC_LegacyAnimeActivity): void
 
         /**
+         * Set a custom rich presence activity.
+         * @param activity - The custom activity to set
+         */
+        setCustomActivity(activity: $app.DiscordRPC_CustomActivity): void
+
+        /**
          * Cancels the current activity by closing the discord RPC client
          */
         cancelActivity(): void
@@ -2425,6 +2534,15 @@ declare namespace $storage {
     function get<T = any>(key: string): T | undefined
 
     /**
+     * Gets a value from the storage without cloning.
+     * Use with caution. Do not mutate the returned object or its nested values.
+     * @param key - The key to get
+     * @returns The value associated with the key
+     * @throws Error if something goes wrong
+     */
+    function getUnsafe<T = any>(key: string): T | undefined
+
+    /**
      * Removes a value from the storage.
      * @param key - The key to remove
      * @throws Error if something goes wrong
@@ -2460,10 +2578,45 @@ declare namespace $storage {
 }
 
 declare namespace $anilist {
+    type RequestProvider = "official" | (string & {})
+
+    type CustomClientOptions = {
+        /** Display name returned by getRequestProvider. Defaults to "custom". */
+        name?: string
+        /** Absolute GraphQL endpoint for an AniList-compatible API. */
+        endpoint: string
+        /** Optional bearer token convenience field. Custom headers may be used instead. */
+        token?: string
+        /** Headers applied to every GraphQL request. */
+        headers?: Record<string, string>
+        /** Marks the client as authenticated even when no bearer token is provided. */
+        authenticated?: boolean
+    }
+
     /**
      * Deletes all cached data.
      */
     function clearCache(): void
+
+    /**
+     * Get the currently active AniList request provider.
+     * Permissions needed: custom-client
+     */
+    function getRequestProvider(): RequestProvider
+
+    /**
+     * Switch back to the official AniList API at runtime.
+     * Prompts the user before switching.
+     * Permissions needed: custom-client
+     */
+    function useOfficialApi(): Promise<void>
+
+    /**
+     * Switch to a custom AniList-compatible GraphQL API at runtime.
+     * Prompts the user before switching.
+     * Permissions needed: custom-client
+     */
+    function useCustomApi(options: CustomClientOptions): Promise<void>
 
     /**
      * Refresh the anime collection.
@@ -2622,53 +2775,6 @@ declare namespace $anilist {
 }
 
 /**
- * Cron
- */
-
-declare namespace $cron {
-    /**
-     * Adds a cron job
-     * @param id - The id of the cron job
-     * @param cronExpr - The cron expression
-     * @param fn - The function to call
-     */
-    function add(id: string, cronExpr: string, fn: () => void): void
-
-    /**
-     * Removes a cron job
-     * @param id - The id of the cron job
-     */
-    function remove(id: string): void
-
-    /**
-     * Removes all cron jobs
-     */
-    function removeAll(): void
-
-    /**
-     * Gets the total number of cron jobs
-     * @returns The total number of cron jobs
-     */
-    function total(): number
-
-    /**
-     * Starts the cron jobs, can be paused by calling stop()
-     */
-    function start(): void
-
-    /**
-     * Stops the cron jobs, can be resumed by calling start()
-     */
-    function stop(): void
-
-    /**
-     * Checks if the cron jobs have started
-     * @returns True if the cron jobs have started, false otherwise
-     */
-    function hasStarted(): boolean
-}
-
-/**
  * Database
  */
 
@@ -2715,6 +2821,11 @@ declare namespace $database {
          * Get the Anilist username
          */
         function getUsername(): string
+
+        /**
+         * Get the Anilist avatar URL
+         */
+        function getAvatarUrl(): string
     }
 
     namespace autoDownloaderRules {

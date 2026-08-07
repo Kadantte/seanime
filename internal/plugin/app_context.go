@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"seanime/internal/api/anilist"
 	"seanime/internal/api/metadata_provider"
 	"seanime/internal/continuity"
 	"seanime/internal/database/db"
@@ -10,11 +11,13 @@ import (
 	discordrpc_presence "seanime/internal/discordrpc/presence"
 	"seanime/internal/events"
 	"seanime/internal/extension"
+	"seanime/internal/extension_repo/prompt"
 	"seanime/internal/library/autodownloader"
 	"seanime/internal/library/autoscanner"
 	"seanime/internal/library/fillermanager"
 	"seanime/internal/library/playbackmanager"
 	"seanime/internal/manga"
+	"seanime/internal/mediacore"
 	"seanime/internal/mediaplayers/mediaplayer"
 	"seanime/internal/mediastream"
 	"seanime/internal/onlinestream"
@@ -56,10 +59,38 @@ type AppContextModules struct {
 	TorrentstreamRepository         *torrentstream.Repository
 	FillerManager                   *fillermanager.FillerManager
 	VideoCore                       *videocore.VideoCore
+	MediacoreCoordinator            *mediacore.Coordinator
 	DirectStreamManager             *directstream.Manager
 	AutoSelect                      *autoselect.AutoSelect
 	OnRefreshAnilistAnimeCollection func()
 	OnRefreshAnilistMangaCollection func()
+	PromptManager                   *prompt.Manager
+	Auth                            AuthActions
+	Anilist                         AnilistActions
+	Settings                        SettingsActions
+	Extensions                      ExtensionActions
+}
+
+type AuthActions struct {
+	Login  func(token string) error
+	Logout func() error
+}
+
+type AnilistActions struct {
+	UseOfficialClient func() error
+	UseCustomClient   func(config anilist.CustomClientConfig) error
+}
+
+type SettingsActions struct {
+	OnSaved              func(settings *models.Settings)
+	OnMediastreamSaved   func(settings *models.MediastreamSettings)
+	OnTorrentstreamSaved func(settings *models.TorrentstreamSettings)
+	OnDebridSaved        func(settings *models.DebridSettings)
+}
+
+type ExtensionActions struct {
+	SetDisabled func(id string, disabled bool) error
+	GetName     func(id string) string
 }
 
 // AppContext allows plugins to interact with core modules.
@@ -73,6 +104,7 @@ type AppContext interface {
 	Database() mo.Option[*db.Database]
 	PlaybackManager() mo.Option[*playbackmanager.PlaybackManager]
 	VideoCore() mo.Option[*videocore.VideoCore]
+	MediacoreCoordinator() mo.Option[*mediacore.Coordinator]
 	DirectStreamManager() mo.Option[*directstream.Manager]
 	MediaPlayerRepository() mo.Option[*mediaplayer.Repository]
 	AnilistPlatformRef() mo.Option[*util.Ref[platform.Platform]]
@@ -85,10 +117,11 @@ type AppContext interface {
 	// BindStorage binds $storage to the Goja runtime
 	BindStorage(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler) *Storage
 	// BindAnilist binds $anilist to the Goja runtime
-	BindAnilist(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension)
+	BindAnilist(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
+	// BindAnilistCustomClient binds runtime client swap APIs to $anilist
+	BindAnilistCustomClient(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
 	// BindDatabase binds $database to the Goja runtime
 	BindDatabase(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension)
-
 	// BindSystem binds $system to the Goja runtime
 	BindSystem(vm *goja.Runtime, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
 
@@ -100,6 +133,15 @@ type AppContext interface {
 
 	// BindCronToContextObj binds 'cron' to the UI context object
 	BindCronToContextObj(vm *goja.Runtime, obj *goja.Object, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler) *Cron
+
+	// BindAuthToContextObj binds 'auth' to the UI context object
+	BindAuthToContextObj(vm *goja.Runtime, obj *goja.Object, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
+
+	// BindAppSettingsToContextObj binds 'appSettings' to the UI context object
+	BindAppSettingsToContextObj(vm *goja.Runtime, obj *goja.Object, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
+
+	// BindExtensionsToContextObj binds 'extensions' to the UI context object
+	BindExtensionsToContextObj(vm *goja.Runtime, obj *goja.Object, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
 
 	// BindDownloaderToContextObj binds 'downloader' to the UI context object
 	BindDownloaderToContextObj(vm *goja.Runtime, obj *goja.Object, logger *zerolog.Logger, ext *extension.Extension, scheduler *gojautil.Scheduler)
@@ -192,9 +234,15 @@ type AppContextImpl struct {
 	onRefreshAnilistAnimeCollection mo.Option[func()]
 	onRefreshAnilistMangaCollection mo.Option[func()]
 	videoCore                       mo.Option[*videocore.VideoCore]
+	mediacoreCoordinator            mo.Option[*mediacore.Coordinator]
 	directStreamManager             mo.Option[*directstream.Manager]
 	isOfflineRef                    *util.Ref[bool]
 	autoSelect                      mo.Option[*autoselect.AutoSelect]
+	promptManager                   mo.Option[*prompt.Manager]
+	auth                            AuthActions
+	anilist                         AnilistActions
+	settings                        SettingsActions
+	extensions                      ExtensionActions
 }
 
 func NewAppContext() AppContext {
@@ -222,9 +270,11 @@ func NewAppContext() AppContext {
 		onRefreshAnilistAnimeCollection: mo.None[func()](),
 		onRefreshAnilistMangaCollection: mo.None[func()](),
 		videoCore:                       mo.None[*videocore.VideoCore](),
+		mediacoreCoordinator:            mo.None[*mediacore.Coordinator](),
 		directStreamManager:             mo.None[*directstream.Manager](),
 		isOfflineRef:                    util.NewRef(false),
 		autoSelect:                      mo.None[*autoselect.AutoSelect](),
+		promptManager:                   mo.None[*prompt.Manager](),
 	}
 
 	return appCtx
@@ -248,6 +298,10 @@ func (a *AppContextImpl) PlaybackManager() mo.Option[*playbackmanager.PlaybackMa
 
 func (a *AppContextImpl) VideoCore() mo.Option[*videocore.VideoCore] {
 	return a.videoCore
+}
+
+func (a *AppContextImpl) MediacoreCoordinator() mo.Option[*mediacore.Coordinator] {
+	return a.mediacoreCoordinator
 }
 
 func (a *AppContextImpl) DirectStreamManager() mo.Option[*directstream.Manager] {
@@ -368,8 +422,50 @@ func (a *AppContextImpl) SetModulesPartial(modules AppContextModules) {
 		a.videoCore = mo.Some(modules.VideoCore)
 	}
 
+	if modules.MediacoreCoordinator != nil {
+		a.mediacoreCoordinator = mo.Some(modules.MediacoreCoordinator)
+	}
+
 	if modules.DirectStreamManager != nil {
 		a.directStreamManager = mo.Some(modules.DirectStreamManager)
+	}
+
+	if modules.PromptManager != nil {
+		a.promptManager = mo.Some(modules.PromptManager)
+	}
+
+	if modules.Auth.Login != nil {
+		a.auth.Login = modules.Auth.Login
+	}
+	if modules.Auth.Logout != nil {
+		a.auth.Logout = modules.Auth.Logout
+	}
+
+	if modules.Anilist.UseOfficialClient != nil {
+		a.anilist.UseOfficialClient = modules.Anilist.UseOfficialClient
+	}
+	if modules.Anilist.UseCustomClient != nil {
+		a.anilist.UseCustomClient = modules.Anilist.UseCustomClient
+	}
+
+	if modules.Settings.OnSaved != nil {
+		a.settings.OnSaved = modules.Settings.OnSaved
+	}
+	if modules.Settings.OnMediastreamSaved != nil {
+		a.settings.OnMediastreamSaved = modules.Settings.OnMediastreamSaved
+	}
+	if modules.Settings.OnTorrentstreamSaved != nil {
+		a.settings.OnTorrentstreamSaved = modules.Settings.OnTorrentstreamSaved
+	}
+	if modules.Settings.OnDebridSaved != nil {
+		a.settings.OnDebridSaved = modules.Settings.OnDebridSaved
+	}
+
+	if modules.Extensions.SetDisabled != nil {
+		a.extensions.SetDisabled = modules.Extensions.SetDisabled
+	}
+	if modules.Extensions.GetName != nil {
+		a.extensions.GetName = modules.Extensions.GetName
 	}
 }
 
